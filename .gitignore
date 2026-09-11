@@ -7,3 +7,6 @@ artifacts/
 tools/
 .vs/
 *.user
+
+# Local-only release notes template (do not publish with source)
+RELEASE_NOTES_TEMPLATE.md
