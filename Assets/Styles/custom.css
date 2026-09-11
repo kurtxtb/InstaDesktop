@@ -1,0 +1,85 @@
+/* 1. Global. Ctrl+Shift+R reloads customization without navigating. */
+:root[data-instadesktop] {
+    --instadesktop-scrollbar-thumb: #99999988;
+    scrollbar-width: thin;
+    scrollbar-color: var(--instadesktop-scrollbar-thumb) transparent;
+}
+
+/* 2. Instagram Navigation Removal. JS marks only verified global route clusters.
+   Instagram sets these rail widths in its own rules, requiring a targeted override. */
+:root[data-instadesktop-has-nav]:not([data-instadesktop-show-nav]) {
+    --nav-wide-width: 0px !important;
+    --nav-medium-width: 0px !important;
+    --nav-narrow-width: 0px !important;
+}
+:root[data-instadesktop] [data-instadesktop-footer] { display: none !important; }
+:root[data-instadesktop]:not([data-instadesktop-show-nav]) [data-instadesktop-nav] * { visibility: hidden !important; }
+:root[data-instadesktop-has-nav]:not([data-instadesktop-show-nav]) [data-instadesktop-main] {
+    margin-inline: 0;
+    width: 100%;
+    min-width: 0;
+}
+
+/* 3. Feed. Keep each photo bounded and retain its intrinsic aspect ratio. */
+:root[data-instadesktop-compact][data-instadesktop-route="feed"] [data-instadesktop-main] {
+    --feed-width: 680px;
+    --feed-sidebar-width: 280px;
+    padding-block: 12px;
+}
+:root[data-instadesktop-compact][data-instadesktop-route="feed"] article {
+    width: min(100%, 680px);
+    max-width: 680px;
+    margin-inline: auto;
+}
+
+/* 4. Direct Messages. Columns are marked only when a thread list and composer
+   are siblings. Unrecognized or narrow layouts retain Instagram's own rules. */
+@media (min-width: 900px) {
+    :root[data-instadesktop-compact][data-instadesktop-route="direct"] [data-instadesktop-dm] {
+        display: flex;
+        width: 100%;
+        min-width: 0;
+    }
+    :root[data-instadesktop-compact][data-instadesktop-route="direct"] [data-instadesktop-chat-list] {
+        flex: 0 0 310px;
+        width: 310px;
+        min-width: 280px;
+        max-width: 340px;
+    }
+    :root[data-instadesktop-compact][data-instadesktop-route="direct"] [data-instadesktop-conversation] {
+        flex: 1 1 0;
+        width: auto;
+        min-width: 0;
+    }
+}
+
+/* 5. Reels. Do not resize video surfaces or reposition native controls. */
+:root[data-instadesktop-compact][data-instadesktop-route="reels"] [data-instadesktop-main] { padding-block: 0; }
+
+/* 6. Explore. Expand the content surface; Instagram keeps ownership of the grid. */
+:root[data-instadesktop-compact][data-instadesktop-route="explore"] [data-instadesktop-main] {
+    max-width: 1440px;
+    padding-inline: 16px;
+    box-sizing: border-box;
+}
+
+/* 7. Dialogs. Retain Instagram stacking and geometry for upload and post modals.
+   Only scrollable dialog content gets the same visible scrollbar treatment. */
+:root[data-instadesktop] [role="dialog"] { scrollbar-width: thin; }
+
+/* 8. Scrollbar. Never hide the draggable thumb. */
+:root[data-instadesktop] ::-webkit-scrollbar { width: 10px; height: 10px; }
+:root[data-instadesktop] ::-webkit-scrollbar-track { background: transparent; }
+:root[data-instadesktop] ::-webkit-scrollbar-thumb {
+    background: var(--instadesktop-scrollbar-thumb);
+    border: 2px solid transparent;
+    border-radius: 5px;
+    background-clip: padding-box;
+}
+:root[data-instadesktop] ::-webkit-scrollbar-thumb:hover { background-color: #b8b8bcaa; }
+
+/* 9. Responsive. The native sidebar compacts independently, never via zoom. */
+@media (max-width: 850px) {
+    :root[data-instadesktop-compact][data-instadesktop-route="feed"] article { width: 100%; }
+    :root[data-instadesktop-compact][data-instadesktop-route="explore"] [data-instadesktop-main] { padding-inline: 8px; }
+}

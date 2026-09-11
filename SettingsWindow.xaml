@@ -1,0 +1,47 @@
+<Window x:Class="InstaDesktop.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="InstaDesktop Settings" Icon="Assets/Icons/app.ico" Width="540" Height="680" MinWidth="500" MinHeight="560"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False" FontFamily="Segoe UI"
+        Background="{StaticResource AppBackground}" Closing="Window_Closing">
+    <Grid Margin="28">
+        <Grid.RowDefinitions><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <TextBlock Text="Settings" FontSize="26" FontWeight="SemiBold" Margin="0,0,0,16" />
+                <TextBlock Text="General" Foreground="{StaticResource PrimaryText}" FontWeight="SemiBold" Margin="0,0,0,6" />
+                <CheckBox x:Name="StartupCheck" Content="Start with Windows (in tray)" />
+                <TextBlock Text="Close button behavior" Margin="0,10,0,6" />
+                <ComboBox x:Name="CloseBehaviorCombo" MinHeight="32" AutomationProperties.Name="Close button behavior">
+                    <ComboBoxItem Content="Minimize to tray" /><ComboBoxItem Content="Exit application" />
+                </ComboBox>
+                <TextBlock Text="Appearance" Foreground="{StaticResource PrimaryText}" FontWeight="SemiBold" Margin="0,22,0,6" Visibility="Collapsed" />
+                <TextBlock Text="Sidebar mode" Margin="0,0,0,6" />
+                <ComboBox x:Name="SidebarModeCombo" Visibility="Collapsed" AutomationProperties.Name="Sidebar mode"><ComboBoxItem Content="Expanded" /><ComboBoxItem Content="Compact" /></ComboBox>
+                <CheckBox x:Name="CompactLayoutCheck" Visibility="Collapsed" Content="Compact Instagram layout" />
+                <CheckBox x:Name="CustomizationCheck" Visibility="Collapsed" Content="UI customization (CSS / JavaScript)" />
+                <TextBlock Text="Performance" Foreground="{StaticResource PrimaryText}" FontWeight="SemiBold" Margin="0,22,0,6" />
+                <CheckBox x:Name="AppNotificationsCheck" Content="Desktop notifications" />
+                <TextBlock Text="Controls Instagram's original website notifications." Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap" Margin="0,4,0,8" />
+                <CheckBox x:Name="MicrophoneCheck" Content="Allow microphone" />
+                <CheckBox x:Name="CameraCheck" Content="Allow camera" />
+                <CheckBox x:Name="LowMemoryCheck" Content="Background low-memory mode" />
+                <CheckBox x:Name="HardwareCheck" Content="Hardware acceleration" />
+                <TextBlock Text="Hardware acceleration changes require Exit and relaunch." Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                <TextBlock Text="Advanced" Foreground="{StaticResource PrimaryText}" FontWeight="SemiBold" Margin="0,22,0,6" />
+                <CheckBox x:Name="DevToolsCheck" Content="Developer tools" />
+                <WrapPanel>
+                    <Button Content="Edit assets folder" Click="Assets_Click" Margin="0,0,8,8" />
+                    <Button Content="Open logs" Click="Logs_Click" Margin="0,0,0,8" />
+                    <Button Content="Reset website permissions" Click="Permissions_Click" Margin="0,0,0,8" />
+                </WrapPanel>
+                <TextBlock x:Name="StatusText" Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap" Margin="0,8,0,0" AutomationProperties.LiveSetting="Polite" />
+            </StackPanel>
+        </ScrollViewer>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="CancelButton" Content="Cancel" Click="Cancel_Click" IsCancel="True" Margin="0,0,8,0" />
+            <Button x:Name="SaveButton" Content="Save" Click="Save_Click" IsDefault="True" MinWidth="90" />
+        </StackPanel>
+    </Grid>
+</Window>
+

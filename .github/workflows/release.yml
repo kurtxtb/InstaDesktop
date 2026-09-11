@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: nuget/setup-nuget@v2
+      - name: Publish
+        run: dotnet publish InstaDesktop.csproj -c Release -r win-x64 --self-contained true -p:PublishProfile=Stable
+      - name: Build installer
+        shell: cmd
+        run: build-installer.bat --no-pause
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: publish/installer/InstaDesktop-Setup.exe
+          generate_release_notes: true
