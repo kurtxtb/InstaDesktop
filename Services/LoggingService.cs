@@ -7,7 +7,7 @@ namespace InstaDesktop.Services;
 public enum LogEvent
 {
     AppStarted, WebViewInitializationError, InjectionError, NavigationError,
-    WebViewProcessError, UnexpectedException
+    WebViewProcessError, NotificationReceived, DesktopNotificationShown, UnexpectedException
 }
 
 public static class LoggingService

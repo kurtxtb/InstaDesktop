@@ -49,7 +49,7 @@ public partial class App : Application
                     "profile-" + Guid.NewGuid().ToString("N")));
             }
             else if (!AcquireInstance()) { Shutdown(); return; }
-            LoggingService.Write(LogEvent.AppStarted);
+            LoggingService.Write(LogEvent.AppStarted, code: typeof(App).Assembly.GetName().Version?.Build ?? 0);
             await Settings.LoadAsync();
             var window = new MainWindow(Settings, e.Args.Contains("--background"));
             MainWindow = window;

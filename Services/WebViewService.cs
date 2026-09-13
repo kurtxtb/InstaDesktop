@@ -25,6 +25,7 @@ public sealed class WebViewService : IDisposable
     private bool _memoryApiAvailable = true;
     private bool _background;
     private bool _injectionErrorReported;
+    private DateTime _notificationReadyAt = DateTime.UtcNow;
     private CoreWebView2MemoryUsageTargetLevel? _memoryTarget;
     public WebView2? View { get; private set; }
     public CoreWebView2? Core => View?.CoreWebView2;
@@ -40,6 +41,7 @@ public sealed class WebViewService : IDisposable
     public event Action<bool, bool>? HistoryChanged;
     public event Action<bool>? FullscreenChanged;
     public event Action<string>? UserNotice;
+    public event Action<string, string>? DesktopNotification;
     public NavigationSection CurrentSection { get; private set; } = NavigationSection.Home;
 
     public WebViewService(Grid host, Window owner, SettingsService settings)
@@ -74,10 +76,12 @@ public sealed class WebViewService : IDisposable
             _host.Children.Add(View);
             await View.EnsureCoreWebView2Async(environment).WaitAsync(TimeSpan.FromSeconds(30));
             if (_disposed) return;
-            ConfigureCore(View.CoreWebView2);
+            await ConfigureCoreAsync(View.CoreWebView2);
+            await EnsureNotificationPermissionAsync(View.CoreWebView2);
             await UpdateInjectionAsync();
             SetBackground(_background);
             View.CoreWebView2.Navigate(NavigationPolicy.Home);
+            _notificationReadyAt = DateTime.UtcNow.AddSeconds(4);
         }
         catch (Exception e)
         {
@@ -90,7 +94,25 @@ public sealed class WebViewService : IDisposable
         finally { _operation.Release(); }
     }
 
-    private void ConfigureCore(CoreWebView2 core)
+    private static async Task EnsureNotificationPermissionAsync(CoreWebView2 core)
+    {
+        // Instagram uses the Web Notifications API for message alerts. A
+        // previous denial is persisted in the WebView2 profile, so explicitly
+        // restore the default permission on every startup.
+        try
+        {
+            await core.Profile.SetPermissionStateAsync(
+                CoreWebView2PermissionKind.Notifications,
+                NavigationPolicy.Home,
+                CoreWebView2PermissionState.Allow);
+        }
+        catch (Exception error) when (error is COMException or NotImplementedException)
+        {
+            LoggingService.Write(LogEvent.UnexpectedException, error);
+        }
+    }
+
+    private async Task ConfigureCoreAsync(CoreWebView2 core)
     {
         var s = core.Settings;
         s.AreDevToolsEnabled = _settings.Current.DeveloperTools;
@@ -116,27 +138,85 @@ public sealed class WebViewService : IDisposable
         try { core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Dark; }
         catch (Exception e) when (e is NotImplementedException or COMException) { }
         core.NotificationReceived += NotificationReceived;
+        await core.AddScriptToExecuteOnDocumentCreatedAsync("""
+            (() => {
+              try {
+                const NativeNotification = window.Notification;
+                if (!NativeNotification || NativeNotification.__instaDesktopWrapped) return;
+                function InstaDesktopNotification(title, options) {
+                  try { window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title:String(title||'Instagram'), body:String(options?.body||'')})); } catch {}
+                  return new NativeNotification(title, options);
+                }
+                InstaDesktopNotification.prototype = NativeNotification.prototype;
+                for (const key of ['permission','requestPermission']) {
+                  try { Object.defineProperty(InstaDesktopNotification, key, {get:()=>NativeNotification[key]}); } catch {}
+                }
+                InstaDesktopNotification.__instaDesktopWrapped = true;
+                try { Object.defineProperty(window, 'Notification', {value: InstaDesktopNotification, configurable: true}); }
+                catch { window.Notification = InstaDesktopNotification; }
+                try { window.chrome?.webview?.postMessage('instadesktop:notification-bridge-ready'); } catch {}
+                const seen = new Set();
+                const scan = node => {
+                  try {
+                    const el = node?.nodeType === 1 ? node : node?.parentElement;
+                    if (!el) return;
+                    const live = el.matches('[role="alert"],[aria-live="polite"],[aria-live="assertive"]') ? el : el.querySelector('[role="alert"],[aria-live="polite"],[aria-live="assertive"]');
+                    if (!live || seen.has(live)) return;
+                    const body = (live.innerText || live.textContent || '').replace(/\s+/g,' ').trim();
+                    if (!body || body.length < 3 || body.length > 500) return;
+                    seen.add(live);
+                    const direct = location.pathname.toLowerCase().startsWith('/direct');
+                    window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title: direct ? 'Instagram Direct' : 'Instagram', body}));
+                  } catch {}
+                };
+                new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(scan))).observe(document.documentElement, {subtree:true, childList:true});
+                let lastUnread = -1;
+                const checkDirectUnread = () => {
+                  try {
+                    if (!location.pathname.toLowerCase().startsWith('/direct')) { lastUnread = -1; return; }
+                    const match = (document.title || '').match(/\(\s*(\d+)\s*\)/);
+                    const count = match ? Number(match[1]) : 0;
+                    if (lastUnread >= 0 && count > lastUnread && performance.now() > 5000)
+                      window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title:'Instagram Direct', body:'You have a new direct message.'}));
+                    lastUnread = count;
+                  } catch {}
+                };
+                setInterval(checkDirectUnread, 1500);
+                let lastBadge = null;
+                const checkUnreadBadges = () => {
+                  try {
+                    const nodes = [...document.querySelectorAll('[aria-label],[title],[data-testid]')];
+                    const hits = nodes.filter(el => /unread|new message|direct message|未讀|新訊息/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')+' '+(el.getAttribute('data-testid')||'')));
+                    const signature = hits.map(el => (el.getAttribute('aria-label')||el.getAttribute('title')||el.getAttribute('data-testid')||'').slice(0,120)).sort().join('|');
+                    if (lastBadge === null) { lastBadge = signature; return; }
+                    if (signature !== lastBadge && hits.length > 0 && performance.now() > 5000) {
+                      const direct = location.pathname.toLowerCase().startsWith('/direct') || /direct/i.test(signature);
+                      window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title: direct ? 'Instagram Direct' : 'Instagram', body: direct ? 'You have a new direct message.' : 'You have new Instagram activity.'}));
+                    }
+                    lastBadge = signature;
+                  } catch {}
+                };
+                setInterval(checkUnreadBadges, 2000);
+              } catch {}
+            })();
+            """);
     }
 
     private void NotificationReceived(object? sender, CoreWebView2NotificationReceivedEventArgs e)
     {
-        // Keep Instagram's original WebView2 notification surface when app
-        // notifications are enabled. WebView2 opens the notification's target
-        // URL itself when the user clicks it. The app setting only controls
-        // whether the website notification is allowed to be shown.
-        if (_settings.Current.AppNotifications)
-        {
-            e.Handled = false;
-            return;
-        }
-
-        // Suppress the website notification when the user disables app
-        // notifications. Marking it handled prevents WebView2 from displaying
-        // its native notification UI.
+        LoggingService.Write(LogEvent.NotificationReceived);
+        if (DateTime.UtcNow < _notificationReadyAt) return;
+        // WebView2's default notification surface is not consistently exposed
+        // as a Windows desktop toast for unpackaged WPF apps. Handle it here
+        // and route it through the app's tray icon instead.
         e.Handled = true;
+        if (!_settings.Current.AppNotifications) return;
         try
         {
-            e.Notification.ReportClosed();
+            DesktopNotification?.Invoke(
+                string.IsNullOrWhiteSpace(e.Notification.Title) ? "Instagram" : e.Notification.Title,
+                string.IsNullOrWhiteSpace(e.Notification.Body) ? "You have a new notification." : e.Notification.Body);
+            e.Notification.ReportShown();
         }
         catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
     }
@@ -311,11 +391,26 @@ public sealed class WebViewService : IDisposable
 
     private void WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
-        if (!NavigationPolicy.IsTrusted(e.Source) || !_settings.Current.UiCustomization) return;
+        if (!NavigationPolicy.IsTrusted(e.Source)) return;
         try
         {
             string json = e.WebMessageAsJson;
+            if (!_settings.Current.UiCustomization && !json.Contains("instadesktop:notification", StringComparison.Ordinal)) return;
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind == JsonValueKind.String)
+            {
+                var text = doc.RootElement.GetString();
+                if (text?.StartsWith("{\"type\":\"instadesktop:notification\"", StringComparison.Ordinal) == true)
+                {
+                    LoggingService.Write(LogEvent.NotificationReceived);
+                    using var notification = JsonDocument.Parse(text);
+                    var notificationRoot = notification.RootElement;
+                    DesktopNotification?.Invoke(notificationRoot.GetProperty("title").GetString() ?? "Instagram", notificationRoot.GetProperty("body").GetString() ?? "You have a new notification.");
+                    return;
+                }
+            }
             if (json.Length > 4096) return;
+            if (json == "\"instadesktop:notification-bridge-ready\"") { LoggingService.Write(LogEvent.NotificationReceived, code: 1); return; }
             if (json == "\"instadesktop:injection-error\"") { ReportInjectionError(); return; }
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;

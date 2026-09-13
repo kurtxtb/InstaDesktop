@@ -56,6 +56,7 @@ public partial class MainWindow : Window
         _web.HistoryChanged += (back, forward) => { BackButton.IsEnabled = back; ForwardButton.IsEnabled = forward; };
         _web.FullscreenChanged += SetMediaFullscreen;
         _web.UserNotice += ShowNotice;
+        _web.DesktopNotification += ShowDesktopNotification;
         SetSelectedSection(NavigationSection.Home);
         _web.StatusChanged += (message, recoverable) =>
         {
@@ -400,6 +401,15 @@ public partial class MainWindow : Window
         if (message.Contains('\n'))
             _tray?.ShowBalloonTip(5000, "Instagram", message.Replace('\n', ' '), Forms.ToolTipIcon.Info);
         NoticePanel.Visibility = Visibility.Collapsed;
+    }
+    private void ShowDesktopNotification(string title, string body)
+    {
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (_disposed || _settings.Current.AppNotifications == false) return;
+            _tray?.ShowBalloonTip(8000, title, body.Replace('\n', ' '), Forms.ToolTipIcon.Info);
+            LoggingService.Write(LogEvent.DesktopNotificationShown);
+        }));
     }
     private void DismissNotice_Click(object sender, RoutedEventArgs e) => NoticePanel.Visibility = Visibility.Collapsed;
     private void Settings_Click(object sender, RoutedEventArgs e) => ShowSettings();
