@@ -25,7 +25,7 @@
                 <TextBlock Text="Controls Instagram's original website notifications." Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap" Margin="0,4,0,8" />
                 <CheckBox x:Name="MicrophoneCheck" Content="Allow microphone" />
                 <CheckBox x:Name="CameraCheck" Content="Allow camera" />
-                <CheckBox x:Name="LowMemoryCheck" Content="Background low-memory mode" />
+                <CheckBox x:Name="LowMemoryCheck" Content="Background low-memory mode (when desktop notifications are off)" />
                 <CheckBox x:Name="HardwareCheck" Content="Hardware acceleration" />
                 <TextBlock Text="Hardware acceleration changes require Exit and relaunch." Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap" Margin="0,4,0,0" />
                 <TextBlock Text="Advanced" Foreground="{StaticResource PrimaryText}" FontWeight="SemiBold" Margin="0,22,0,6" />

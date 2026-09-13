@@ -1,19 +1,30 @@
 using System;
 using System.IO;
 using System.Text;
+using InstaDesktop.Models;
 
 namespace InstaDesktop.Services;
 
 public enum LogEvent
 {
     AppStarted, WebViewInitializationError, InjectionError, NavigationError,
-    WebViewProcessError, NotificationReceived, DesktopNotificationShown, UnexpectedException
+    WebViewProcessError, NotificationReceived, DesktopNotificationShown, UnexpectedException,
+    NotificationPermission, NotificationCandidate, NotificationDuplicate, NotificationAccepted,
+    NotificationBaseline, NotificationDiagnostic, NotificationRejected, NotificationRegistered,
+    NotificationInitializationFailed, NotificationImageFailed, NotificationLifecycleFailed,
+    WindowsNotificationRequested, WindowsNotificationSubmitted, WindowsNotificationUnavailable,
+    WindowsNotificationFailed, NotificationActivated, NotificationActivationFailed, NotificationNavigated
 }
 
 public static class LoggingService
 {
     private const long MaxBytes = 512 * 1024;
     private static readonly object Gate = new();
+
+    // Source + body length + presence bits only. No body, name, URL, tag or token.
+    public static void Notification(LogEvent name, InstagramNotification n) =>
+        Write(name, code: (int)n.Source * 100000 + Math.Min(n.Body.Length, 1000) * 10 +
+            (string.IsNullOrEmpty(n.SenderName) ? 0 : 1) + (n.AvatarUrl is null ? 0 : 2) + (n.ThreadUrl is null ? 0 : 4));
 
     // Only fixed event names, exception types and numeric codes enter the log.
     // Exception messages, stack traces, web content and URLs can contain secrets.

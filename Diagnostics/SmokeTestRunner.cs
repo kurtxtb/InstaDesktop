@@ -147,7 +147,7 @@ internal static class SmokeTestRunner
             window.WindowState = WindowState.Minimized;
             Check(!core.IsSuspended, "minimized without suspension", checks);
             if (window.Web.MemoryApiAvailable)
-                Check(core.MemoryUsageTargetLevel == CoreWebView2MemoryUsageTargetLevel.Low, "minimize sets low memory", checks);
+                Check(core.MemoryUsageTargetLevel == (settings.Current.AppNotifications ? CoreWebView2MemoryUsageTargetLevel.Normal : CoreWebView2MemoryUsageTargetLevel.Low), "minimize respects notification memory policy", checks);
             window.ShowFromTray();
             if (window.Web.MemoryApiAvailable)
                 Check(core.MemoryUsageTargetLevel == CoreWebView2MemoryUsageTargetLevel.Normal, "restore sets normal memory", checks);

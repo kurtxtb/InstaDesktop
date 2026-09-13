@@ -25,7 +25,9 @@ public sealed class WebViewService : IDisposable
     private bool _memoryApiAvailable = true;
     private bool _background;
     private bool _injectionErrorReported;
-    private DateTime _notificationReadyAt = DateTime.UtcNow;
+    private string? _notificationScriptId;
+    private string? _pendingNotificationThread;
+    private readonly NotificationService _notifications;
     private CoreWebView2MemoryUsageTargetLevel? _memoryTarget;
     public WebView2? View { get; private set; }
     public CoreWebView2? Core => View?.CoreWebView2;
@@ -41,17 +43,17 @@ public sealed class WebViewService : IDisposable
     public event Action<bool, bool>? HistoryChanged;
     public event Action<bool>? FullscreenChanged;
     public event Action<string>? UserNotice;
-    public event Action<string, string>? DesktopNotification;
     public NavigationSection CurrentSection { get; private set; } = NavigationSection.Home;
 
-    public WebViewService(Grid host, Window owner, SettingsService settings)
+    public WebViewService(Grid host, Window owner, SettingsService settings, NotificationService notifications)
     {
         _host = host;
         _owner = owner;
         _settings = settings;
+        _notifications = notifications;
     }
 
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(Action<CoreWebView2>? diagnosticConfigure = null)
     {
         await _operation.WaitAsync();
         try
@@ -76,12 +78,13 @@ public sealed class WebViewService : IDisposable
             _host.Children.Add(View);
             await View.EnsureCoreWebView2Async(environment).WaitAsync(TimeSpan.FromSeconds(30));
             if (_disposed) return;
+            diagnosticConfigure?.Invoke(View.CoreWebView2);
             await ConfigureCoreAsync(View.CoreWebView2);
             await EnsureNotificationPermissionAsync(View.CoreWebView2);
             await UpdateInjectionAsync();
             SetBackground(_background);
-            View.CoreWebView2.Navigate(NavigationPolicy.Home);
-            _notificationReadyAt = DateTime.UtcNow.AddSeconds(4);
+            View.CoreWebView2.Navigate(_pendingNotificationThread ?? NavigationPolicy.Home);
+            _pendingNotificationThread = null;
         }
         catch (Exception e)
         {
@@ -94,21 +97,24 @@ public sealed class WebViewService : IDisposable
         finally { _operation.Release(); }
     }
 
-    private static async Task EnsureNotificationPermissionAsync(CoreWebView2 core)
+    private async Task EnsureNotificationPermissionAsync(CoreWebView2 core)
     {
         // Instagram uses the Web Notifications API for message alerts. A
         // previous denial is persisted in the WebView2 profile, so explicitly
-        // restore the default permission on every startup.
+        // synchronize the two expected origins with the app's notification setting.
         try
         {
             await core.Profile.SetPermissionStateAsync(
                 CoreWebView2PermissionKind.Notifications,
                 NavigationPolicy.Home,
-                CoreWebView2PermissionState.Allow);
+                _settings.Current.AppNotifications ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny);
+            await core.Profile.SetPermissionStateAsync(CoreWebView2PermissionKind.Notifications,
+                "https://instagram.com", _settings.Current.AppNotifications ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny);
+            LoggingService.Write(LogEvent.NotificationPermission, code: _settings.Current.AppNotifications ? 1 : 0);
         }
-        catch (Exception error) when (error is COMException or NotImplementedException)
+        catch (Exception error)
         {
-            LoggingService.Write(LogEvent.UnexpectedException, error);
+            LoggingService.Write(LogEvent.NotificationInitializationFailed, error);
         }
     }
 
@@ -137,90 +143,65 @@ public sealed class WebViewService : IDisposable
         core.ContainsFullScreenElementChanged += (_, _) => FullscreenChanged?.Invoke(core.ContainsFullScreenElement);
         try { core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Dark; }
         catch (Exception e) when (e is NotImplementedException or COMException) { }
-        core.NotificationReceived += NotificationReceived;
-        await core.AddScriptToExecuteOnDocumentCreatedAsync("""
-            (() => {
-              try {
-                const NativeNotification = window.Notification;
-                if (!NativeNotification || NativeNotification.__instaDesktopWrapped) return;
-                function InstaDesktopNotification(title, options) {
-                  try { window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title:String(title||'Instagram'), body:String(options?.body||'')})); } catch {}
-                  return new NativeNotification(title, options);
-                }
-                InstaDesktopNotification.prototype = NativeNotification.prototype;
-                for (const key of ['permission','requestPermission']) {
-                  try { Object.defineProperty(InstaDesktopNotification, key, {get:()=>NativeNotification[key]}); } catch {}
-                }
-                InstaDesktopNotification.__instaDesktopWrapped = true;
-                try { Object.defineProperty(window, 'Notification', {value: InstaDesktopNotification, configurable: true}); }
-                catch { window.Notification = InstaDesktopNotification; }
-                try { window.chrome?.webview?.postMessage('instadesktop:notification-bridge-ready'); } catch {}
-                const seen = new Set();
-                const scan = node => {
-                  try {
-                    const el = node?.nodeType === 1 ? node : node?.parentElement;
-                    if (!el) return;
-                    const live = el.matches('[role="alert"],[aria-live="polite"],[aria-live="assertive"]') ? el : el.querySelector('[role="alert"],[aria-live="polite"],[aria-live="assertive"]');
-                    if (!live || seen.has(live)) return;
-                    const body = (live.innerText || live.textContent || '').replace(/\s+/g,' ').trim();
-                    if (!body || body.length < 3 || body.length > 500) return;
-                    seen.add(live);
-                    const direct = location.pathname.toLowerCase().startsWith('/direct');
-                    window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title: direct ? 'Instagram Direct' : 'Instagram', body}));
-                  } catch {}
-                };
-                new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(scan))).observe(document.documentElement, {subtree:true, childList:true});
-                let lastUnread = -1;
-                const checkDirectUnread = () => {
-                  try {
-                    if (!location.pathname.toLowerCase().startsWith('/direct')) { lastUnread = -1; return; }
-                    const match = (document.title || '').match(/\(\s*(\d+)\s*\)/);
-                    const count = match ? Number(match[1]) : 0;
-                    if (lastUnread >= 0 && count > lastUnread && performance.now() > 5000)
-                      window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title:'Instagram Direct', body:'You have a new direct message.'}));
-                    lastUnread = count;
-                  } catch {}
-                };
-                setInterval(checkDirectUnread, 1500);
-                let lastBadge = null;
-                const checkUnreadBadges = () => {
-                  try {
-                    const nodes = [...document.querySelectorAll('[aria-label],[title],[data-testid]')];
-                    const hits = nodes.filter(el => /unread|new message|direct message|未讀|新訊息/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')+' '+(el.getAttribute('data-testid')||'')));
-                    const signature = hits.map(el => (el.getAttribute('aria-label')||el.getAttribute('title')||el.getAttribute('data-testid')||'').slice(0,120)).sort().join('|');
-                    if (lastBadge === null) { lastBadge = signature; return; }
-                    if (signature !== lastBadge && hits.length > 0 && performance.now() > 5000) {
-                      const direct = location.pathname.toLowerCase().startsWith('/direct') || /direct/i.test(signature);
-                      window.chrome?.webview?.postMessage(JSON.stringify({type:'instadesktop:notification', title: direct ? 'Instagram Direct' : 'Instagram', body: direct ? 'You have a new direct message.' : 'You have new Instagram activity.'}));
-                    }
-                    lastBadge = signature;
-                  } catch {}
-                };
-                setInterval(checkUnreadBadges, 2000);
-              } catch {}
-            })();
-            """);
+        try { core.NotificationReceived += NotificationReceived; }
+        catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
+        await ConfigureNotificationsAsync(core);
+    }
+
+    private async Task ConfigureNotificationsAsync(CoreWebView2 core)
+    {
+        try
+        {
+            // Use the embedded bridge so upgrades cannot leave an obsolete copy
+            // behind when the installer preserves user-editable customization.
+            using var stream = typeof(WebViewService).Assembly.GetManifestResourceStream("InstaDesktop.Assets.Scripts.notifications.js")
+                ?? throw new FileNotFoundException();
+            using var reader = new StreamReader(stream);
+            string script = "window.__InstaDesktopNotificationsEnabled = " +
+                (_settings.Current.AppNotifications ? "true;\n" : "false;\n") + await reader.ReadToEndAsync();
+            string next = await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
+            if (_notificationScriptId is not null) core.RemoveScriptToExecuteOnDocumentCreated(_notificationScriptId);
+            _notificationScriptId = next;
+            if (NotificationPolicy.IsInstagramOrigin(core.Source))
+            {
+                await core.ExecuteScriptAsync(script);
+                await core.ExecuteScriptAsync("window.__InstaDesktopNotifications?.setEnabled(window.__InstaDesktopNotificationsEnabled);");
+            }
+        }
+        catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
     }
 
     private void NotificationReceived(object? sender, CoreWebView2NotificationReceivedEventArgs e)
     {
-        LoggingService.Write(LogEvent.NotificationReceived);
-        if (DateTime.UtcNow < _notificationReadyAt) return;
-        // WebView2's default notification surface is not consistently exposed
-        // as a Windows desktop toast for unpackaged WPF apps. Handle it here
-        // and route it through the app's tray icon instead.
+        // Always mark handled, including disabled mode: don't leak duplicate browser UI.
         e.Handled = true;
-        if (!_settings.Current.AppNotifications) return;
+        LoggingService.Write(LogEvent.NotificationReceived);
+        if (_disposed || !_settings.Current.AppNotifications || !NotificationPolicy.IsInstagramOrigin(e.SenderOrigin)) return;
         try
         {
-            DesktopNotification?.Invoke(
-                string.IsNullOrWhiteSpace(e.Notification.Title) ? "Instagram" : e.Notification.Title,
-                string.IsNullOrWhiteSpace(e.Notification.Body) ? "You have a new notification." : e.Notification.Body);
-            e.Notification.ReportShown();
+            var native = e.Notification;
+            DateTimeOffset timestamp = DateTimeOffset.UtcNow;
+            bool hasTimestamp = false;
+            if (native.Timestamp > DateTime.UnixEpoch)
+            {
+                timestamp = new DateTimeOffset(native.Timestamp.ToUniversalTime());
+                hasTimestamp = true;
+            }
+            // Notification data/click URLs aren't exposed by this SDK. Only use a
+            // tag as a route when it is itself an exact, validated Direct URL.
+            string? thread = NotificationPolicy.DirectUrl(native.Tag);
+            _notifications.Receive(new InstagramNotification
+            {
+                Source = NotificationSource.NativeWebView,
+                Type = thread is null ? InstagramNotificationType.Instagram : InstagramNotificationType.DirectMessage,
+                Title = native.Title, Body = native.Body, Tag = native.Tag,
+                AvatarUrl = native.IconUri, ImageUrl = native.BodyImageUri,
+                ThreadUrl = thread, Origin = new Uri(e.SenderOrigin).GetLeftPart(UriPartial.Authority),
+                Timestamp = timestamp, HasSourceTimestamp = hasTimestamp, Silent = native.IsSilent
+            }, native);
         }
-        catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
+        catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
     }
-
     private void NavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
         if (NavigationPolicy.IsTrusted(e.Uri))
@@ -300,7 +281,13 @@ public sealed class WebViewService : IDisposable
             return;
         }
         if (e.PermissionKind == CoreWebView2PermissionKind.Notifications)
-        { e.State = CoreWebView2PermissionState.Allow; e.SavesInProfile = true; return; }
+        {
+            e.State = _settings.Current.AppNotifications && NotificationPolicy.IsInstagramOrigin(e.Uri)
+                ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny;
+            e.SavesInProfile = true;
+            LoggingService.Write(LogEvent.NotificationPermission, code: (int)e.State);
+            return;
+        }
         if (e.PermissionKind == CoreWebView2PermissionKind.Microphone && !_settings.Current.AllowMicrophone)
         { e.State = CoreWebView2PermissionState.Deny; return; }
         if (e.PermissionKind == CoreWebView2PermissionKind.Camera && !_settings.Current.AllowCamera)
@@ -395,26 +382,35 @@ public sealed class WebViewService : IDisposable
         try
         {
             string json = e.WebMessageAsJson;
-            if (!_settings.Current.UiCustomization && !json.Contains("instadesktop:notification", StringComparison.Ordinal)) return;
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.ValueKind == JsonValueKind.String)
+            if (json.Length > 16384) { LoggingService.Write(LogEvent.NotificationRejected); return; }
+            if (NotificationPolicy.TryParse(e.Source, json, out var candidate))
             {
-                var text = doc.RootElement.GetString();
-                if (text?.StartsWith("{\"type\":\"instadesktop:notification\"", StringComparison.Ordinal) == true)
-                {
-                    LoggingService.Write(LogEvent.NotificationReceived);
-                    using var notification = JsonDocument.Parse(text);
-                    var notificationRoot = notification.RootElement;
-                    DesktopNotification?.Invoke(notificationRoot.GetProperty("title").GetString() ?? "Instagram", notificationRoot.GetProperty("body").GetString() ?? "You have a new notification.");
-                    return;
-                }
+                if (_settings.Current.AppNotifications) _notifications.Receive(candidate!);
+                return;
             }
-            if (json.Length > 4096) return;
-            if (json == "\"instadesktop:notification-bridge-ready\"") { LoggingService.Write(LogEvent.NotificationReceived, code: 1); return; }
-            if (json == "\"instadesktop:injection-error\"") { ReportInjectionError(); return; }
-            using var document = JsonDocument.Parse(json);
+            using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 8 });
             var root = document.RootElement;
+            if (root.ValueKind == JsonValueKind.String)
+            {
+                if (_settings.Current.UiCustomization && root.GetString() == "instadesktop:injection-error") ReportInjectionError();
+                return;
+            }
             if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String) return;
+            if (type.GetString() == "instadesktop:notification") { LoggingService.Write(LogEvent.NotificationRejected); return; }
+            if (type.GetString() == "instadesktop:notification-diagnostic")
+            {
+                if (!_settings.Current.AppNotifications || !NotificationPolicy.IsInstagramOrigin(e.Source)) return;
+                if (root.TryGetProperty("event", out var evt) && evt.ValueKind == JsonValueKind.String &&
+                    root.TryGetProperty("count", out var count) && count.TryGetInt32(out int number) && number >= 0 && number <= 10000)
+                {
+                    int kind = evt.GetString() switch { "baseline" => 1, "permission" => 2, "workers" => 3,
+                        "workers-active" => 4, "workers-unavailable" => 5, "wrapper-unavailable" => 6, _ => 0 };
+                    if (kind != 0) LoggingService.Write(kind == 1 ? LogEvent.NotificationBaseline : LogEvent.NotificationDiagnostic,
+                        code: kind * 10000 + number);
+                }
+                return;
+            }
+            if (!_settings.Current.UiCustomization || json.Length > 4096) return;
             if (type.GetString() is "routeChanged" or "pageLoaded")
             {
                 // Page messages only request a refresh. Core.Source remains authoritative.
@@ -444,7 +440,7 @@ public sealed class WebViewService : IDisposable
     private async void SourceChanged(object? sender, CoreWebView2SourceChangedEventArgs e)
     {
         PublishNavigationState();
-        if (e.IsNewDocument || !_settings.Current.UiCustomization || Core is not { } core ||
+        if (e.IsNewDocument || Core is not { } core ||
             !NavigationPolicy.IsTrusted(core.Source)) return;
         try { await core.ExecuteScriptAsync("window.dispatchEvent(new Event('instadesktop:navigation'));"); }
         catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
@@ -456,7 +452,9 @@ public sealed class WebViewService : IDisposable
     {
         _background = background;
         if (NeedsRecovery || !_memoryApiAvailable || Core is not { } core) return;
-        var target = background && _settings.Current.BackgroundLowMemory
+        // Low target may discard renderer resources. Keep normal memory while
+        // notifications are enabled; never suspend the WebView for tray mode.
+        var target = background && _settings.Current.BackgroundLowMemory && !_settings.Current.AppNotifications
             ? CoreWebView2MemoryUsageTargetLevel.Low : CoreWebView2MemoryUsageTargetLevel.Normal;
         if (_memoryTarget == target) return;
         try
@@ -518,6 +516,9 @@ public sealed class WebViewService : IDisposable
     {
         if (Core is not { } core) return;
         core.Settings.AreDevToolsEnabled = _settings.Current.DeveloperTools;
+        if (!_settings.Current.AppNotifications) _notifications.Reset(removeNotifications: true);
+        await EnsureNotificationPermissionAsync(core);
+        await ConfigureNotificationsAsync(core);
         SetBackground(_background);
         if (customizationChanged) await ReloadCustomizationAsync();
         else if (_settings.Current.UiCustomization)
@@ -550,6 +551,8 @@ public sealed class WebViewService : IDisposable
 
     private void DisposeView()
     {
+        _notifications.Reset(removeNotifications: false);
+        _notificationScriptId = null;
         if (View is null) return;
         View.Dispose();
         _host.Children.Remove(View);
@@ -560,6 +563,20 @@ public sealed class WebViewService : IDisposable
     {
         _disposed = true;
         DisposeView();
+    }
+
+    public void NavigateNotificationThread(string? url)
+    {
+        _owner.Dispatcher.VerifyAccess();
+        if (_disposed || NotificationPolicy.DirectUrl(url) is not { } safe) return;
+        if (Core is not { } core || NeedsRecovery || _operation.CurrentCount == 0)
+        {
+            _pendingNotificationThread = safe;
+            if (NeedsRecovery) _ = InitializeAsync();
+            return;
+        }
+        core.Navigate(safe);
+        LoggingService.Write(LogEvent.NotificationNavigated);
     }
 
     private void PublishNavigationState()

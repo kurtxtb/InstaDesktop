@@ -15,7 +15,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0
+MinVersion=10.0.17763
 OutputDir=..\publish\installer
 OutputBaseFilename=InstaDesktop-Setup
 SetupIconFile=..\Assets\Icons\app.ico
@@ -46,6 +46,9 @@ Name: "{autodesktop}\InstaDesktop"; Filename: "{app}\InstaDesktop.exe"; Tasks: d
 
 [Run]
 Filename: "{app}\InstaDesktop.exe"; Description: "Launch InstaDesktop"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{app}\InstaDesktop.exe"; Parameters: "--uninstall-notifications"; Flags: runhidden waituntilterminated
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

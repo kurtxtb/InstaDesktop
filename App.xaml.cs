@@ -16,8 +16,10 @@ public partial class App : Application
     private EventWaitHandle? _activation;
     private RegisteredWaitHandle? _activationWait;
     private bool _ownsMutex;
+    private string? _pendingNotificationActivation;
     internal bool DiagnosticMode { get; private set; }
     internal bool WindowLayoutTest { get; private set; }
+    internal bool NotificationTest { get; private set; }
     internal string? DiagnosticOutput { get; private set; }
     public SettingsService Settings { get; } = new();
 
@@ -41,6 +43,17 @@ public partial class App : Application
                 WindowLayoutTest = diagnosticIndex >= 0;
             }
             DiagnosticMode = diagnosticIndex >= 0;
+            if (!DiagnosticMode)
+            {
+                diagnosticIndex = Array.IndexOf(e.Args, "--notification-test");
+                NotificationTest = DiagnosticMode = diagnosticIndex >= 0;
+            }
+            if (e.Args.Contains("--uninstall-notifications"))
+            {
+                WindowsNotificationService.Uninstall();
+                Shutdown();
+                return;
+            }
             if (DiagnosticMode)
             {
                 if (diagnosticIndex + 1 >= e.Args.Length) { Shutdown(2); return; }
@@ -49,13 +62,23 @@ public partial class App : Application
                     "profile-" + Guid.NewGuid().ToString("N")));
             }
             else if (!AcquireInstance()) { Shutdown(); return; }
+            if (!DiagnosticMode) WindowsNotificationService.Register(arguments =>
+            {
+                if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (MainWindow is MainWindow ready) ready.Notifications.Activate(arguments);
+                    else _pendingNotificationActivation = arguments;
+                }));
+            });
             LoggingService.Write(LogEvent.AppStarted, code: typeof(App).Assembly.GetName().Version?.Build ?? 0);
             await Settings.LoadAsync();
             var window = new MainWindow(Settings, e.Args.Contains("--background"));
             MainWindow = window;
             if (DiagnosticMode) { window.ShowInTaskbar = false; window.Opacity = 0; }
             window.Show();
-            _ = CheckForUpdateAsync();
+            if (_pendingNotificationActivation is { } activation)
+            { window.Notifications.Activate(activation); _pendingNotificationActivation = null; }
+            if (!DiagnosticMode) _ = CheckForUpdateAsync();
         }
         catch (Exception error)
         {

@@ -9,6 +9,7 @@
 - Native Windows experience for [Instagram](https://www.instagram.com/)
 - WebView2-based; no Electron, Node.js runtime, or private Instagram API
 - System tray, single-instance behavior, and persistent window layout
+- Windows desktop DM notifications with native payloads, conservative DOM fallback, and safe thread activation
 - Editable CSS and JavaScript assets
 - Self-contained, single-file, and automatic GitHub Release updates
 
@@ -24,7 +25,7 @@ At startup, InstaDesktop checks the latest GitHub Release for `InstaDesktop-Setu
 
 ## 🛠️ Build from source
 
-Requirements: Windows 10/11 x64, [.NET SDK 8.0.300+](https://dotnet.microsoft.com/download/dotnet/8.0), and [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer.
+Requirements: Windows 10 1809 or newer / Windows 11 x64, [.NET SDK 8.0.300+](https://dotnet.microsoft.com/download/dotnet/8.0), and [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer.
 
 ```powershell
 .\build-release.bat --no-pause
@@ -38,6 +39,8 @@ Requirements: Windows 10/11 x64, [.NET SDK 8.0.300+](https://dotnet.microsoft.co
 | Single-file app | `publish\\single-file\\InstaDesktop.exe` |
 
 ## 🔐 Privacy
+
+Notification architecture, platform limitations, automated checks and the two-account manual checklist are documented in [NOTIFICATIONS.md](NOTIFICATIONS.md).
 
 InstaDesktop displays Instagram in WebView2. It does not read, store, or transmit your Instagram password; login data is managed by the WebView2 profile on your device.
 
