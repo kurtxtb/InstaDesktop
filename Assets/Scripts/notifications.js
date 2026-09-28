@@ -15,6 +15,7 @@
     } catch { return null; }
   };
   let enabled = false, observer, timer, safety, baselineTimer, baselineSignature = '', armed = false;
+  let badgeArmed = false, badgeBaselineTimer, badgeDecreaseTimer, badgeMissingTimer, badgeDecrease = null, extractionFailed = false;
   let sequence = 0, badge = null, route = location.pathname;
   const epoch = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const rows = new Map();
@@ -39,89 +40,120 @@
     return found ? count : null;
   }
 
-  function readRow(anchor) {
-    const path = threadPath(anchor.getAttribute('href'));
-    if (!path || !visible(anchor)) return null;
-    // Only use explicit unread semantics. Bold names and small colored circles
-    // alone are ambiguous (active users, selected rows, themes) and aren't proof.
-    const indicator = anchor.querySelector('[data-unread], [data-is-unread], [data-unread-count]');
-    const marker = indicator || anchor;
-    const rawCount = marker.getAttribute('data-unread-count');
-    const count = /^\d{1,4}$/.test(rawCount || '') ? Number(rawCount) : null;
-    let unread = count !== null ? count > 0 : null;
-    const flag = marker.getAttribute('data-unread') ?? marker.getAttribute('data-is-unread');
-    if (flag === 'true' || flag === 'false') unread = flag === 'true';
-    // Supplementary accessibility labels, never the sole extraction strategy.
-    if (unread === null) {
-      const label = anchor.getAttribute('aria-label') || '';
-      if (/\bunread\b|未讀|未読/i.test(label)) unread = true;
-    }
-    const explicitName = anchor.querySelector('[data-conversation-name]');
-    const explicitPreview = anchor.querySelector('[data-message-preview]');
-    // Only accept a two-line row with one avatar as an unambiguous name/preview
-    // layout. More complex/group/time/status rows degrade instead of guessing.
-    const lines = String(anchor.innerText || '').split(/\r?\n/).map(x => text(x)).filter(Boolean);
-    const images = anchor.querySelectorAll('img');
-    const simple = lines.length === 2 && images.length === 1 && !anchor.querySelector('time');
-    const title = text(explicitName?.textContent || (simple ? lines[0] : ''), 160);
-    const preview = text(explicitPreview?.textContent || (simple ? lines[1] : ''));
-    const sender = text(anchor.querySelector('[data-sender-name]')?.textContent, 160);
-    return { path, unread, count, title, preview, sender, avatar: images.length === 1 ? images[0].currentSrc || images[0].src : null };
-  }
-
   function scan() {
     timer = null;
     if (!enabled) return;
     const changedRoute = route !== location.pathname;
     route = location.pathname;
     if (changedRoute) {
-      rows.clear(); badge = null; armed = false; baselineSignature = '';
+      // Navigation replaces conversation rows, but the global inbox count is
+      // still the same account state. Keep its independent baseline alive.
+      rows.clear(); armed = false; baselineSignature = '';
       clearTimeout(baselineTimer);
     }
     const now = Date.now(), nextBadge = readBadge();
-    const badgeIncreased = badge !== null && nextBadge !== null && nextBadge > badge;
     const previousBadge = badge;
+    const badgeIncreased = observeBadge(nextBadge);
     let detailed = false, baselines = 0;
     const present = new Set();
-    for (const anchor of document.querySelectorAll('a[href*="/direct/t/"]')) {
-      const current = readRow(anchor);
-      if (!current || present.has(current.path)) continue;
-      present.add(current.path);
-      const previous = rows.get(current.path);
-      // Rows absent for a scan (virtualization, navigation) are baselined again.
-      // Discovering old unread rows is never evidence of a new message.
-      const incoming = armed && previous && current.unread === true &&
-        ((previous.unread === false) ||
-         (previous.count !== null && current.count !== null && current.count > previous.count) ||
-         (badgeIncreased && current.preview && previous.preview && current.preview !== previous.preview));
-      if (incoming) {
-        const preview = current.sender && current.sender !== current.title && !current.preview.startsWith(current.sender + ':')
-          ? current.sender + ': ' + current.preview : current.preview;
-        send({ source: 'dom', threadUrl: current.path, unread: true,
-          title: current.title || 'Instagram', body: current.title && current.preview ? text(preview) : 'You have a new message',
-          ...(current.sender ? { senderName: current.sender } : {}),
-          ...(current.avatar ? { avatarUrl: current.avatar } : {}) });
-        detailed = true;
-      } else if (!previous) baselines++;
-      rows.set(current.path, { ...current, at: now });
+    try {
+      for (const row of window.__InstaDesktopInboxDom?.readRows() || []) {
+        if (!row || typeof row.rowKey !== 'string') continue;
+        const current = { path: row.threadUrl, key: row.rowKey, unread: row.isUnread, count: row.unreadCount,
+          title: row.conversationName, preview: row.preview, sender: row.senderName, avatar: row.avatarUrl, outgoing: row.outgoing };
+        if (!current || present.has(current.key)) continue;
+        present.add(current.key);
+        const previous = rows.get(current.key);
+        // Rows absent for a scan (virtualization, navigation) are baselined again.
+        // Discovering old unread rows is never evidence of a new message.
+        const incoming = armed && previous && !current.outgoing && current.unread === true &&
+          ((previous.unread === false) ||
+           (previous.unread === null && current.preview && previous.preview && current.preview !== previous.preview) ||
+           (previous.count !== null && current.count !== null && current.count > previous.count) ||
+           (badgeIncreased && current.preview && previous.preview && current.preview !== previous.preview));
+        if (incoming) {
+          const preview = current.sender && current.sender !== current.title && !current.preview.startsWith(current.sender + ':')
+            ? current.sender + ': ' + current.preview : current.preview;
+          send({ source: 'dom', ...(current.path ? { threadUrl: current.path } : {}), rowKey: current.key, unread: true,
+            title: current.title || 'Instagram', body: current.title && current.preview ? text(preview) : 'You have a new message',
+            ...(current.sender ? { senderName: current.sender } : {}),
+            ...(current.avatar ? { avatarUrl: current.avatar } : {}) });
+          detailed = true;
+        } else if (!previous) baselines++;
+        rows.set(current.key, { ...current, at: now });
+      }
+      for (const key of rows.keys()) if (!present.has(key)) rows.delete(key);
+      // Bound state even on an unexpectedly large page.
+      while (rows.size > 256) rows.delete(rows.keys().next().value);
+      extractionFailed = false;
+    } catch {
+      // Details are optional. A selector/layout failure must not consume a
+      // real badge increase or stop future scans. Rebaseline recovered rows.
+      rows.clear(); armed = false; baselineSignature = '';
+      clearTimeout(baselineTimer);
+      if (!extractionFailed) diagnostic('rows-unavailable', 1);
+      extractionFailed = true;
     }
-    for (const key of rows.keys()) if (!present.has(key)) rows.delete(key);
-    // Bound state even on an unexpectedly large page.
-    while (rows.size > 256) rows.delete(rows.keys().next().value);
-    if (armed && badgeIncreased && !detailed) send({ source: 'badge', unread: true });
+    if (badgeIncreased && !detailed) send({ source: 'badge', unread: true });
     if (baselines || (previousBadge === null && nextBadge !== null)) diagnostic('baseline', baselines);
-    badge = nextBadge;
     // Hydration often inserts the nav link, badge and old rows in separate
-    // mutations. Arm only after the observed notification state settles, not
-    // after a process-age blackout. Native/page notifications remain immediate.
-    if (!armed && (nextBadge !== null || rows.size)) {
-      const signature = JSON.stringify([nextBadge, [...rows.values()].map(r => [r.path, r.unread, r.count, r.preview, r.sender])]);
+    // mutations. Settle rows separately so animation or virtualization cannot
+    // keep basic badge notifications unarmed indefinitely.
+    if (!armed && rows.size) {
+      const signature = JSON.stringify([...rows.values()].map(r => [r.key, r.unread, r.count, r.preview, r.sender]));
       if (signature !== baselineSignature) {
         baselineSignature = signature;
         clearTimeout(baselineTimer);
         baselineTimer = setTimeout(() => { armed = true; diagnostic('baseline', rows.size); }, 650);
       }
     }
+  }
+
+  function observeBadge(next) {
+    if (next === null) {
+      // A temporarily hidden/replaced navigation link is not a read event.
+      clearTimeout(badgeBaselineTimer); clearTimeout(badgeDecreaseTimer);
+      badgeBaselineTimer = badgeDecreaseTimer = null; badgeDecrease = null;
+      // One that stays missing past the settle window leaves a stale count
+      // (logout, account switch, rebuilt page): rebaseline when it returns.
+      if (!badgeMissingTimer) badgeMissingTimer = setTimeout(() => {
+        badgeMissingTimer = null;
+        if (enabled) { badge = null; badgeArmed = false; }
+      }, 650);
+      return false;
+    }
+    clearTimeout(badgeMissingTimer); badgeMissingTimer = null;
+    if (!badgeArmed) {
+      if (badge !== next || !badgeBaselineTimer) {
+        badge = next; clearTimeout(badgeBaselineTimer);
+        badgeBaselineTimer = setTimeout(() => {
+          badgeBaselineTimer = null;
+          if (!enabled) return;
+          // Read once more so an unscanned hydration mutation cannot arm an
+          // outdated zero just before the initial unread badge is inserted.
+          if (readBadge() === badge) { badgeArmed = true; diagnostic('baseline'); }
+          else schedule();
+        }, 650);
+      }
+      return false;
+    }
+    if (next < badge) {
+      // React can rebuild a badge as empty, then restore the old count. A
+      // decrease must settle before it can establish a new lower baseline.
+      if (badgeDecrease !== next) {
+        badgeDecrease = next; clearTimeout(badgeDecreaseTimer);
+        badgeDecreaseTimer = setTimeout(() => {
+          badgeDecreaseTimer = null;
+          if (enabled && readBadge() === badgeDecrease) badge = badgeDecrease;
+          badgeDecrease = null;
+        }, 650);
+      }
+      return false;
+    }
+    clearTimeout(badgeDecreaseTimer); badgeDecreaseTimer = null; badgeDecrease = null;
+    const increased = next > badge;
+    badge = next;
+    return increased;
   }
 
   function schedule() {
@@ -133,14 +165,16 @@
     if (enabled === Boolean(value)) return;
     enabled = Boolean(value);
     observer?.disconnect(); clearTimeout(timer); clearInterval(safety); clearTimeout(baselineTimer);
-    timer = safety = baselineTimer = null; rows.clear(); badge = null; armed = false; baselineSignature = '';
+    clearTimeout(badgeBaselineTimer); clearTimeout(badgeDecreaseTimer); clearTimeout(badgeMissingTimer);
+    timer = safety = baselineTimer = badgeBaselineTimer = badgeDecreaseTimer = badgeMissingTimer = null;
+    rows.clear(); badge = badgeDecrease = null; armed = badgeArmed = extractionFailed = false; baselineSignature = '';
     if (!enabled) return;
     // Observe the document so replacement of the body/root does not detach us.
     observer = new MutationObserver(schedule);
     observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true,
-      attributeFilter: ['href', 'aria-label', 'data-unread', 'data-is-unread', 'data-unread-count', 'data-count'] });
-    scan();
+      attributeFilter: ['href', 'aria-label', 'data-unread', 'data-is-unread', 'data-unread-count', 'data-count', 'class', 'style', 'aria-hidden', 'src', 'data-message-direction', 'data-is-own-message'] });
     safety = setInterval(schedule, 15000);
+    scan();
     diagnostic('permission', { granted: 1, denied: 2, default: 0 }[window.Notification?.permission] ?? 0);
     navigator.serviceWorker?.getRegistrations().then(registrations => {
       if (!enabled) return;

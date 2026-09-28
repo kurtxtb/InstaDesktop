@@ -7,6 +7,8 @@ using System.Threading.Tasks;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
+using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using Microsoft.Win32;
@@ -28,7 +30,17 @@ public sealed class WebViewService : IDisposable
     private string? _notificationScriptId;
     private string? _pendingNotificationThread;
     private readonly NotificationService _notifications;
+    private DirectInboxMonitor? _directMonitor;
+    private readonly DispatcherTimer _directMonitorCheck;
+    private bool _checkingDirectMonitor, _diagnosticInitialization;
+    private DateTimeOffset _nextDirectMonitorAttempt;
     private CoreWebView2MemoryUsageTargetLevel? _memoryTarget;
+    // Diagnostics only: lets the isolated notification runner exercise the real
+    // monitor lifecycle against offline fixtures. Never set in normal mode.
+    internal Action<CoreWebView2>? DiagnosticMonitorConfigure { get; set; }
+    internal DirectInboxMonitor? DirectMonitor => _directMonitor;
+    private bool MonitorAllowed => _settings.Current.AppNotifications &&
+        (!_diagnosticInitialization || DiagnosticMonitorConfigure is not null);
     public WebView2? View { get; private set; }
     public CoreWebView2? Core => View?.CoreWebView2;
     public bool NeedsRecovery { get; private set; }
@@ -51,6 +63,9 @@ public sealed class WebViewService : IDisposable
         _owner = owner;
         _settings = settings;
         _notifications = notifications;
+        _directMonitorCheck = new DispatcherTimer(TimeSpan.FromSeconds(30), DispatcherPriority.Background,
+            async (_, _) => await RefreshDirectMonitorAsync(), owner.Dispatcher);
+        _directMonitorCheck.Stop();
     }
 
     public async Task InitializeAsync(Action<CoreWebView2>? diagnosticConfigure = null)
@@ -60,6 +75,7 @@ public sealed class WebViewService : IDisposable
         {
             if (_disposed) return;
             DisposeView();
+            _diagnosticInitialization = diagnosticConfigure is not null;
             NeedsRecovery = false;
             LastFailure = null;
             _memoryApiAvailable = true;
@@ -80,6 +96,8 @@ public sealed class WebViewService : IDisposable
             if (_disposed) return;
             diagnosticConfigure?.Invoke(View.CoreWebView2);
             await ConfigureCoreAsync(View.CoreWebView2);
+            _notifications.DirectInboxMonitoring = MonitorAllowed;
+            if (_notifications.DirectInboxMonitoring) _directMonitorCheck.Start();
             await EnsureNotificationPermissionAsync(View.CoreWebView2);
             await UpdateInjectionAsync();
             SetBackground(_background);
@@ -102,15 +120,10 @@ public sealed class WebViewService : IDisposable
         // Instagram uses the Web Notifications API for message alerts. A
         // previous denial is persisted in the WebView2 profile, so explicitly
         // synchronize the two expected origins with the app's notification setting.
+        // The hidden inbox monitor shares this profile and relies on this state.
         try
         {
-            await core.Profile.SetPermissionStateAsync(
-                CoreWebView2PermissionKind.Notifications,
-                NavigationPolicy.Home,
-                _settings.Current.AppNotifications ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny);
-            await core.Profile.SetPermissionStateAsync(CoreWebView2PermissionKind.Notifications,
-                "https://instagram.com", _settings.Current.AppNotifications ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny);
-            LoggingService.Write(LogEvent.NotificationPermission, code: _settings.Current.AppNotifications ? 1 : 0);
+            await NotificationPermissionPolicy.SyncAsync(core.Profile, () => _settings.Current.AppNotifications);
         }
         catch (Exception error)
         {
@@ -154,11 +167,9 @@ public sealed class WebViewService : IDisposable
         {
             // Use the embedded bridge so upgrades cannot leave an obsolete copy
             // behind when the installer preserves user-editable customization.
-            using var stream = typeof(WebViewService).Assembly.GetManifestResourceStream("InstaDesktop.Assets.Scripts.notifications.js")
-                ?? throw new FileNotFoundException();
-            using var reader = new StreamReader(stream);
             string script = "window.__InstaDesktopNotificationsEnabled = " +
-                (_settings.Current.AppNotifications ? "true;\n" : "false;\n") + await reader.ReadToEndAsync();
+                (_settings.Current.AppNotifications ? "true;\n" : "false;\n") +
+                await ReadNotificationAssetAsync("direct-inbox-dom.js") + "\n" + await ReadNotificationAssetAsync("notifications.js");
             string next = await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
             if (_notificationScriptId is not null) core.RemoveScriptToExecuteOnDocumentCreated(_notificationScriptId);
             _notificationScriptId = next;
@@ -171,12 +182,34 @@ public sealed class WebViewService : IDisposable
         catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
     }
 
+    internal static async Task<string> ReadNotificationAssetAsync(string name)
+    {
+        using var stream = typeof(WebViewService).Assembly.GetManifestResourceStream("InstaDesktop.Assets.Scripts." + name)
+            ?? throw new FileNotFoundException();
+        using var reader = new StreamReader(stream);
+        return await reader.ReadToEndAsync();
+    }
+
     private void NotificationReceived(object? sender, CoreWebView2NotificationReceivedEventArgs e)
     {
         // Always mark handled, including disabled mode: don't leak duplicate browser UI.
         e.Handled = true;
-        LoggingService.Write(LogEvent.NotificationReceived);
+        LoggingService.Write(LogEvent.NotificationReceived, code: 1);
         if (_disposed || !_settings.Current.AppNotifications || !NotificationPolicy.IsInstagramOrigin(e.SenderOrigin)) return;
+        _ = RefreshDirectMonitorAsync();
+        if (_directMonitor is { } monitor) _ = monitor.RefreshSnapshotAsync();
+        ForwardNativeNotification(_notifications, e, PrimaryEmitter, sender ?? this);
+    }
+
+    internal const string PrimaryEmitter = "primary";
+
+    // Both controllers use the same payload mapping and native lifecycle owner.
+    // The hidden inbox can be the only page that creates an actual notification.
+    // The emitter lets the coordinator collapse one message mirrored by both pages.
+    internal static void ForwardNativeNotification(NotificationService notifications, CoreWebView2NotificationReceivedEventArgs e, string emitter, object owner)
+    {
+        e.Handled = true;
+        if (!NotificationPolicy.IsInstagramOrigin(e.SenderOrigin)) return;
         try
         {
             var native = e.Notification;
@@ -190,20 +223,22 @@ public sealed class WebViewService : IDisposable
             // Notification data/click URLs aren't exposed by this SDK. Only use a
             // tag as a route when it is itself an exact, validated Direct URL.
             string? thread = NotificationPolicy.DirectUrl(native.Tag);
-            _notifications.Receive(new InstagramNotification
+            notifications.Receive(new InstagramNotification
             {
                 Source = NotificationSource.NativeWebView,
                 Type = thread is null ? InstagramNotificationType.Instagram : InstagramNotificationType.DirectMessage,
                 Title = native.Title, Body = native.Body, Tag = native.Tag,
                 AvatarUrl = native.IconUri, ImageUrl = native.BodyImageUri,
                 ThreadUrl = thread, Origin = new Uri(e.SenderOrigin).GetLeftPart(UriPartial.Authority),
-                Timestamp = timestamp, HasSourceTimestamp = hasTimestamp, Silent = native.IsSilent
-            }, native);
+                Timestamp = timestamp, HasSourceTimestamp = hasTimestamp, Silent = native.IsSilent,
+                Emitter = emitter
+            }, native, owner);
         }
         catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
     }
     private void NavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
+        if (IsSessionRoute(e.Uri)) StopDirectMonitor();
         if (NavigationPolicy.IsTrusted(e.Uri))
         {
             _injectionErrorReported = false;
@@ -233,6 +268,7 @@ public sealed class WebViewService : IDisposable
         LastFailure = null;
         if (View is not null) View.Visibility = Visibility.Visible;
         Ready?.Invoke();
+        _ = RefreshDirectMonitorAsync();
         PublishNavigationState();
         // Keep the original Instagram UI while preventing WebView scrollbars
         // from painting a white gutter over the dark page.
@@ -282,10 +318,11 @@ public sealed class WebViewService : IDisposable
         }
         if (e.PermissionKind == CoreWebView2PermissionKind.Notifications)
         {
-            e.State = _settings.Current.AppNotifications && NotificationPolicy.IsInstagramOrigin(e.Uri)
-                ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny;
-            e.SavesInProfile = true;
-            LoggingService.Write(LogEvent.NotificationPermission, code: (int)e.State);
+            // Never a dialog: notifications follow the desktop setting only.
+            var decision = NotificationPermissionPolicy.ForPrimaryNotifications(e.Uri, _settings.Current.AppNotifications);
+            e.State = decision.State;
+            e.SavesInProfile = decision.SavesInProfile;
+            LoggingService.Write(LogEvent.NotificationPermission, code: 10 + (int)e.State);
             return;
         }
         if (e.PermissionKind == CoreWebView2PermissionKind.Microphone && !_settings.Current.AllowMicrophone)
@@ -372,7 +409,11 @@ public sealed class WebViewService : IDisposable
         LoggingService.Write(LogEvent.WebViewProcessError, code: (int)e.ProcessFailedKind);
         if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
             CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+        {
+            // The page that owned these native notifications is gone.
+            if (sender is not null) _notifications.ReleaseNative(sender);
             Fail("Instagram renderer crashed.");
+        }
         // WebView2 automatically recovers ancillary GPU/utility processes.
     }
 
@@ -385,7 +426,12 @@ public sealed class WebViewService : IDisposable
             if (json.Length > 16384) { LoggingService.Write(LogEvent.NotificationRejected); return; }
             if (NotificationPolicy.TryParse(e.Source, json, out var candidate))
             {
-                if (_settings.Current.AppNotifications) _notifications.Receive(candidate!);
+                if (_settings.Current.AppNotifications)
+                {
+                    if (candidate!.Source is NotificationSource.UnreadBadge or NotificationSource.PageNotification &&
+                        _directMonitor is { } monitor) _ = monitor.RefreshSnapshotAsync();
+                    _notifications.Receive(candidate);
+                }
                 return;
             }
             using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 8 });
@@ -404,7 +450,8 @@ public sealed class WebViewService : IDisposable
                     root.TryGetProperty("count", out var count) && count.TryGetInt32(out int number) && number >= 0 && number <= 10000)
                 {
                     int kind = evt.GetString() switch { "baseline" => 1, "permission" => 2, "workers" => 3,
-                        "workers-active" => 4, "workers-unavailable" => 5, "wrapper-unavailable" => 6, _ => 0 };
+                        "workers-active" => 4, "workers-unavailable" => 5, "wrapper-unavailable" => 6,
+                        "rows-unavailable" => 7, _ => 0 };
                     if (kind != 0) LoggingService.Write(kind == 1 ? LogEvent.NotificationBaseline : LogEvent.NotificationDiagnostic,
                         code: kind * 10000 + number);
                 }
@@ -440,6 +487,8 @@ public sealed class WebViewService : IDisposable
     private async void SourceChanged(object? sender, CoreWebView2SourceChangedEventArgs e)
     {
         PublishNavigationState();
+        if (Core is { } sourceCore && IsSessionRoute(sourceCore.Source)) StopDirectMonitor();
+        else _ = RefreshDirectMonitorAsync();
         if (e.IsNewDocument || Core is not { } core ||
             !NavigationPolicy.IsTrusted(core.Source)) return;
         try { await core.ExecuteScriptAsync("window.dispatchEvent(new Event('instadesktop:navigation'));"); }
@@ -514,11 +563,15 @@ public sealed class WebViewService : IDisposable
 
     public async Task ApplySettingsAsync(bool customizationChanged)
     {
+        _notifications.DirectInboxMonitoring = MonitorAllowed;
+        if (!_notifications.DirectInboxMonitoring) { _directMonitorCheck.Stop(); StopDirectMonitor(); }
+        else _directMonitorCheck.Start();
         if (Core is not { } core) return;
         core.Settings.AreDevToolsEnabled = _settings.Current.DeveloperTools;
         if (!_settings.Current.AppNotifications) _notifications.Reset(removeNotifications: true);
         await EnsureNotificationPermissionAsync(core);
         await ConfigureNotificationsAsync(core);
+        _ = RefreshDirectMonitorAsync();
         SetBackground(_background);
         if (customizationChanged) await ReloadCustomizationAsync();
         else if (_settings.Current.UiCustomization)
@@ -537,6 +590,10 @@ public sealed class WebViewService : IDisposable
             if (NavigationPolicy.IsTrusted(permission.PermissionOrigin))
                 await core.Profile.SetPermissionStateAsync(permission.PermissionKind, permission.PermissionOrigin,
                     CoreWebView2PermissionState.Default);
+        // Notification permission follows the desktop setting. Leaving it at
+        // Default here makes Notification.permission stop being granted until
+        // Instagram happens to ask again (or the app is restarted).
+        await EnsureNotificationPermissionAsync(core);
     }
 
     private void Fail(string message)
@@ -551,12 +608,53 @@ public sealed class WebViewService : IDisposable
 
     private void DisposeView()
     {
+        _directMonitorCheck.Stop();
+        StopDirectMonitor();
         _notifications.Reset(removeNotifications: false);
         _notificationScriptId = null;
         if (View is null) return;
         View.Dispose();
         _host.Children.Remove(View);
         View = null;
+    }
+
+    private static bool IsSessionRoute(string url) => Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+        (uri.AbsolutePath.StartsWith("/accounts/", StringComparison.Ordinal) ||
+         uri.AbsolutePath.StartsWith("/challenge", StringComparison.Ordinal));
+
+    internal async Task RefreshDirectMonitorAsync()
+    {
+        if (_disposed || !MonitorAllowed || _checkingDirectMonitor ||
+            NeedsRecovery || Core is not { } primary || !NotificationPolicy.IsInstagramOrigin(primary.Source) || IsSessionRoute(primary.Source)) return;
+        if (_directMonitor?.IsRunning == true) return;
+        if (DateTimeOffset.UtcNow < _nextDirectMonitorAttempt) return;
+        _checkingDirectMonitor = true;
+        try
+        {
+            // Observe signed-in UI readiness only. Never inspect cookies/tokens.
+            string usable = await primary.ExecuteScriptAsync("Boolean(document.querySelector('a[href=\"/direct/inbox/\"],a[href=\"/direct/inbox\"]') && !document.querySelector('input[type=\"password\"]'))")
+                .WaitAsync(TimeSpan.FromSeconds(2));
+            if (_disposed || !MonitorAllowed || Core != primary || NeedsRecovery || IsSessionRoute(primary.Source) || usable != "true") return;
+            // Exactly one monitor per primary: the previous one (stopped by a
+            // route block, crash or reset) is closed with its handlers first.
+            _directMonitor?.Dispose();
+            _nextDirectMonitorAttempt = DateTimeOffset.UtcNow.AddMinutes(2);
+            var monitor = new DirectInboxMonitor(_owner.Dispatcher, _notifications, () => !_disposed && _settings.Current.AppNotifications);
+            _directMonitor = monitor;
+            await monitor.StartAsync(primary, new WindowInteropHelper(_owner).Handle, DiagnosticMonitorConfigure);
+        }
+        catch (Exception error) { LoggingService.Write(LogEvent.DirectMonitorInitializationFailed, error); }
+        finally { _checkingDirectMonitor = false; }
+    }
+
+    // Diagnostics: skip the restart backoff so a test can exercise a restart.
+    internal void ExpireDirectMonitorBackoff() => _nextDirectMonitorAttempt = DateTimeOffset.MinValue;
+
+    private void StopDirectMonitor()
+    {
+        _directMonitor?.Dispose();
+        _directMonitor = null;
+        _nextDirectMonitorAttempt = DateTimeOffset.MinValue;
     }
 
     public void Dispose()

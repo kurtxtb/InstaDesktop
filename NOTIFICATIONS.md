@@ -12,8 +12,9 @@ Sources now enter `NotificationService` as `InstagramNotification` records:
 
 1. **Native WebView2** is preferred. The handler always marks the event handled, captures title, body, icon, body image, tag, origin, SDK timestamp and silent flag, then submits it without a startup blackout. Registration and permission errors are isolated from WebView initialization. Native content is retained, including Instagram's own group/media wording.
 2. **Page Notification** is a transparent constructor proxy. It preserves the native constructor, prototype and bound static permission method. It forwards bounded structured payloads only when enabled and permission is granted. It does not intercept or modify service workers.
-3. **Direct DOM** observes already-loaded thread links and explicit unread state/counts. A two-line, single-avatar layout or explicit conversation/preview semantics can provide real text. Ambiguous layouts use generic text. No requests are made to Instagram private endpoints and no hidden inbox is opened.
+3. **Direct DOM** observes already-loaded thread links and explicit unread state/counts. A two-line, single-avatar layout or explicit conversation/preview semantics can provide real text. Ambiguous layouts use generic text. This primary-page fallback makes no additional inbox navigation or private API requests.
 4. **Global unread badge** watches numeric counts inside the inbox navigation link on any Instagram route. It supplies generic wording when no detailed row transition is available.
+5. **Background Direct inbox** is an optional enrichment source added incrementally on 2026-09-14; see the patch notes below. It uses the same coordinator, deduplicator, image cache and Windows presenter.
 
 The bridge is an embedded asset independent of optional UI customization. Installer-preserved editable assets cannot leave an obsolete bridge installed. The host accepts only a small JSON object contract (16 KiB maximum, bounded depth/fields, exact expected Instagram HTTPS origins). Invalid types, sources, unread flags and Direct URLs are rejected.
 
@@ -27,7 +28,7 @@ A row requires an unread transition, increasing explicit unread count, or a chan
 
 ## Arbitration, deduplication and lifetime
 
-Native candidates can be presented immediately. Page/DOM/badge candidates wait 750/1200/1800 ms to allow richer sources to join the same delivery. Matching uses strong IDs when supplied, same-source state sequences, or native tag plus real timestamp and content. A tag by itself is not a message ID: Instagram can reuse conversation tags.
+Detailed native candidates can be presented immediately. Page/DOM/badge candidates normally wait 750/1200/1800 ms to allow richer sources to join the same delivery. The inbox enrichment option holds eligible generic native/page candidates and Direct evidence for a two-second matching window. Matching uses strong IDs when supplied, same-source state sequences, or native tag plus real timestamp and content. A tag by itself is not a message ID: Instagram can reuse conversation tags.
 
 Cross-source matching uses normalized text and compatible thread URLs within three seconds. A badge with no identity uses a narrower two-second correlation with native/page activity as a last resort. Each delivery consumes at most one distinct event from each source, so a second genuine same-source event or changed sequence is retained even when its text is identical. Late richer metadata silently replaces the existing toast using the same token rather than creating another popup.
 
@@ -130,3 +131,142 @@ Use account A in InstaDesktop and account B on a phone or separate browser. Enab
 11. Restart the app with unread messages again. Expect a fresh silent baseline and retained login/session. Repeat a Home/Direct/Reels navigation cycle without new messages: no notification should be caused solely by navigation.
 
 These account tests are manual; a passing offline report is not evidence that they were performed.
+
+## Incremental Direct inbox enrichment — 2026-09-14
+
+The clean starting tree was commit `1f7bfa1`. This patch adds an optional observation source to that implementation. It does not replace Windows toast presentation, activation/deep links, image downloading/caching, the main-page bridge, app settings, startup or the WebView profile.
+
+### Monitor and session lifetime
+
+`DirectInboxMonitor` creates one CoreWebView2Controller using the primary CoreWebView2.Environment and its exact ProfileName/InPrivate setting. This is WebView2 profile sharing, not cookie copying or an external HTTP login. It uses a 1000×800 layout viewport with IsVisible=false and IsMuted=true. It is not added as a visible WPF control and never requests focus.
+
+WebViewService starts it only with notifications enabled and a usable primary page containing the inbox navigation link, without a password form. SPA/full navigation and native notification receipt can trigger a readiness check; a 30-second check covers late login hydration. A failed/blocked creation has a two-minute retry backoff. Settings disable, primary session/challenge routes, controller replacement and shutdown dispose it. A controller whose asynchronous creation completes after disposal is immediately closed.
+
+Its only navigation target is `https://www.instagram.com/direct/inbox/`. Full navigations away from that URL are cancelled; secondary-frame navigation, new windows, downloads and dialogs are suppressed. Native notifications are marked handled and forwarded to the shared coordinator, preserving their lifecycle; dropping them can lose the only notification received by the hidden controller. The monitor-specific script guards history.pushState/replaceState and stops on a disallowed SPA route. A navigation/session/renderer failure discards monitor evidence while preserving pending generic notifications. Denied monitor permissions are not saved into the shared profile.
+
+No code clicks, scrolls, focuses or opens conversation rows, reads cookies/tokens, intercepts DM network payloads, calls private Instagram endpoints, or sends messages. The user must still verify Instagram's actual server-side read-receipt behavior with two accounts; fixture navigation checks cannot establish that behavior.
+
+### Snapshot evidence and matching
+
+The monitor has its own small embedded script, not the primary Notification constructor wrapper. A document-scoped MutationObserver batches changes at 500 ms with a 15-second safety check. It emits one changed snapshot containing at most 40 naturally loaded thread links. C# validates the inbox origin, document UUID, increasing sequence, JSON depth/size (256 KiB), field types/lengths, unique thread URLs, unread flags/count consistency and the existing Direct URL policy. Avatar URLs use the existing image policy/cache.
+
+Extraction uses thread anchors, explicit unread state/counts, explicit conversation/preview/sender semantics, or a validated two-line, single-avatar row. It has no hashed-class selectors or localized "Unread"/"You:" matching. Explicit outgoing direction excludes a row. **These are defensive supported shapes, not evidence that every current Instagram deployment exposes those attributes.** Unsupported markup yields the existing generic fallback.
+
+The first valid snapshot is silent. Reload/session reset creates a fresh silent baseline. Newly discovered or virtualized rows baseline silently even at the top; they are never assigned to a generic event merely because they appeared recently. An existing row is strong evidence when its preview changes with read→unread, or its unread count increases. A preview change while unread is weak evidence and needs native confirmation. An unclassified competing preview change vetoes attribution.
+
+Eligible generic notifications require the expected Instagram origin, brand-only title and no sender, route, avatar or body-image metadata. A small multilingual allowlist of known generic wording (or an empty/default body) prevents replacing potentially meaningful branded activity alerts. Unknown wording and already-detailed native payloads retain their existing timing/content. This intentionally prefers missed enrichment over a false sender attribution.
+
+The existing coordinator waits **2,000 ms** asynchronously for eligible generic candidates. This accommodates the 500 ms snapshot debounce and background scheduling without introducing a startup blackout. Inbox changes can arrive before or after the native event. The coordinator decides after the complete window, requiring exactly one candidate and exactly one eligible native/page delivery in that interval. Multiple competing changes/events or uncertain evidence preserve the original generic text; independently strong thread events may still display separately.
+
+Successful enrichment updates the original delivery's title, preview, sender, avatar and safe thread URL while retaining native tag/timestamp/silent settings and lifecycle ownership. The existing dedup cache reassigns source records to that same delivery token; no second dedup cache or toast pipeline exists. The main WebView's Direct evidence can participate too, including when the monitor fails. A recognized generic badge/page/native combination cannot claim an arbitrary thread before this decision. Weak unconfirmed changes never display on their own. Distinct sequences and repeated messages several seconds apart retain the existing dedup behavior.
+
+The displayed body is only the available inbox preview, including its ellipsis. No thread is opened to retrieve a complete message. Missing preview text keeps the original generic wording; an optional known name/route can still be retained. When several changes are ambiguous, additional verified DOM notifications can coexist with a generic alert; strict exactly-once association is impossible without a shared message identifier.
+
+### Files in this incremental patch
+
+- Added `Services/DirectInboxMonitor.cs`: owns the hidden shared-profile controller and bounded snapshot baseline.
+- Added `Assets/Scripts/direct-inbox-monitor.js`: inbox-only observer and navigation guards.
+- Extended `Services/WebViewService.cs`: monitor readiness, ownership, retry and disposal hooks.
+- Extended `Services/NotificationService.cs`: two-second opportunity and unambiguous merge inside the existing delivery flow.
+- Extended `Services/NotificationDeduplicator.cs`: defer anonymous attribution and merge delivery tokens in the existing cache.
+- Extended `Models/InstagramNotification.cs`: DirectInbox source and native-confirmation flag; no duplicate notification model.
+- Extended `Services/NotificationPolicy.cs`: conservative multilingual generic recognition; existing route/image validators retained.
+- Extended `Services/LoggingService.cs`: fixed enrichment events only, preserving content-free logging.
+- Extended `Diagnostics/NotificationTestRunner.cs`: snapshot, ambiguity, timing, fallback, shared-profile and hidden-controller fixtures.
+- Updated this document. No package, settings UI, Windows presenter, image-cache, startup, activation or main notification script replacement.
+
+### Manual two-account enrichment checks
+
+Use A in InstaDesktop and B on a phone/separate browser, with Windows and app notifications enabled and Do Not Disturb off. First allow the inbox monitor to establish its baseline (metadata log: DirectMonitorReady / DirectMonitorBaselineCreated). Avoid opening the target thread in A until the explicit click test.
+
+1. **A/F — Baseline and restart:** leave unread messages in existing conversations, start A, then restart again. Expect no stale-notification storm.
+2. **B — Home:** keep A on Home. B sends `hello` in an existing conversation. Expect one enriched notification if supported inbox evidence is available, otherwise the original generic alert after approximately two seconds.
+3. **C — Reels:** keep A on Reels and send another short message. Verify the main page stays on Reels and the notification uses the observed name/preview when available.
+4. **D — Tray:** minimize A to tray for several minutes, then send again. Check both delivery and metadata logs; background scheduling/Instagram updates still require live validation.
+5. **E — Long message:** send a long message. Compare the toast with the naturally visible inbox preview later. Ellipsis/truncation is acceptable; the monitor must not open the thread to expand it.
+6. **G — Repeated text:** send `ok`, wait five seconds, then send `ok` again. Distinct native events or changing inbox counters must not be permanently collapsed by identical text.
+7. **H — Monitor failure:** the offline suite exercises this automatically. For a live debug test, break on the UI thread inside WebViewService after the monitor has started, evaluate `_directMonitor.Dispose()` and `_nextDirectMonitorAttempt = DateTimeOffset.UtcNow.AddMinutes(5)` in the debugger, then continue and send from B. The primary native generic alert must still appear. Restart A afterwards to restore monitoring immediately.
+8. **I — No read receipt (critical):** send from B while A remains on Home/Reels/tray. Do not click the toast or manually open the thread. Confirm on B that enhanced notification receipt alone did not mark the message Seen. This server-side behavior has not been verified by automated tests.
+9. **J — Explicit click:** now click an enriched toast with a known route. A should restore and open the correct conversation through the unchanged activation code. Only this user action authorizes thread navigation.
+10. **Ambiguity/outgoing/settings:** arrange near-simultaneous incoming messages in two conversations; no generic alert may be randomly attributed to one. Send as A and confirm no incoming toast solely from an outgoing preview change. Disable notifications and confirm the monitor stops; re-enable and confirm a fresh silent baseline.
+
+If Instagram omits thread anchors, explicit unread state, or a reliable preview, enrichment remains unavailable. Newly appearing virtualized rows, saturated counters, unknown generic wording, delayed background rendering and missing native events can also limit detail/association. The generic path, previous settings and existing notification implementation remain available.
+
+### Incremental patch verification
+
+- `build-release.bat --no-pause`: restore, Release build and Stable publish passed with zero warnings/errors.
+- `dotnet publish InstaDesktop.csproj -c Release -p:PublishProfile=SingleFile`: passed without warnings/errors.
+- `node --check Assets/Scripts/direct-inbox-monitor.js`: passed.
+- `scripts/verify-notifications.ps1 -Report artifacts/verification/inbox-enrichment-release.json`: all 119 checks passed, including the original 78 notification checks.
+- `scripts/verify-notifications.ps1 -Exe publish/single-file/InstaDesktop.exe -Report artifacts/verification/inbox-enrichment-single-file.json`: all 119 checks passed from the single-file bundle too.
+- Coverage includes generic-first/inbox-first matching, rich native bypass of a pending inbox wait without duplicate submission, ambiguity, weak evidence, failure fallback, shared profile storage, hidden/muted controller behavior, monitor native suppression, DOM replacement, blocked SPA thread navigation and disposal during creation.
+- Windows presentation uses the existing fake presenter. The controller, native lifecycle and DOM checks use the actual WebView2 runtime with intercepted local fixtures in an isolated diagnostic profile. No signed-in Instagram session, real Windows banner or two-account read receipt was tested.
+- Final diff review found no dependency, settings UI, primary bridge, Windows presenter, image-cache or activation replacement. Restore-only lockfile changes were not retained.
+
+## Notification recovery repair (2026-09-14, evening)
+
+The running executable was the installed September 11 build, while the September 14 publish contained the newer notification implementation. The latest installed-process log entries showed only `AppStarted`, without notification registration or permission initialization, even though `AppNotifications` was enabled. The existing Start Menu shortcut also targeted a nonexistent sandbox-user installation. Building a publish does not update either the actual installation or its shortcuts.
+
+Four code paths were repaired:
+
+- Hidden inbox native notifications now enter the same validated payload mapper, coordinator and native lifecycle handling as the primary WebView.
+- Discarding pending inbox evidence also forgets its deduplication records. A following matching native/page notification can no longer resolve to an abandoned delivery and disappear.
+- A matching page notification or strong primary DOM event can restart delivery after the original weak inbox evidence has finished waiting without confirmation.
+- Resetting website permissions reapplies the desktop notification preference to both supported Instagram origins.
+
+Validation for this repair:
+
+- The new core regression reproduced `monitor reset cannot suppress matching native notification` before the fix (`artifacts/verification/notification-repair-core-before.json`).
+- Stable and SingleFile self-contained publishing succeeded. Their core suites each passed 85 checks (`notification-repair-release-core.json`, `notification-repair-single-file-core.json`). These cover policy, deduplication, arbitration, image failure, inbox state and recovery. They do not exercise WebView2 or actual Windows presentation.
+- Both JavaScript bridges passed syntax checks. The repair script passed parser, isolated copy/preservation and rollback checks, plus read-only planning against the actual installation.
+- Full WebView integration could not complete in the sandbox: WebView2 subprocess crashes were logged and the runner exceeded 60 seconds. Automatic review of a normal-Windows retry returned a service-unavailable error. The added hidden-controller lifecycle and permission-reset tests therefore remain pending; real Windows banners and signed-in receipt also remain unverified.
+
+`scripts/verify-notifications.ps1 -CoreOnly` explicitly runs the core subset and records `scope: notification-core`. The default still runs the full integration suite, including the new tests. Diagnostic runs use separate profiles and simulated Windows presentation.
+
+After building and verifying the publish, `scripts/repair-local-install.ps1` can update an existing installation using explicit absolute `-InstallDirectory` and `-ShortcutPath` values. `-WhatIf` previews changes. It backs up changed files and the existing shortcut under `artifacts/install-backups`, requests orderly exit of the exact installed process, preserves existing custom Assets and profile/settings data, verifies installed hashes, restores files on copy failure, and restarts the installed executable. Deployment is a separate action; a successful publish or core test alone does not repair an already-installed copy.
+
+The attempt to apply this repair to the actual installation was also blocked by automatic approval review returning HTTP 503. No installed files, shortcuts or running user process were changed by that attempt. The verified publish and repair script are ready; actual deployment and full integration verification still require an allowed execution context.
+
+## Sender and message preview repair (2026-09-14)
+
+The later report came from the current publish, not the old installed copy. The live log identified a badge-only candidate (`300220`) and an empty inbox baseline (`DirectMonitorBaselineCreated Code=0`). The user confirmed that the inbox visibly displays conversation names and message previews. The previous extractor required thread anchors and unusually strict two-line markup; generic badge events also bypassed enrichment entirely.
+
+The embedded `direct-inbox-dom.js` extractor is now shared by the primary notification bridge and hidden inbox. It accepts thread anchors and avatar/name/preview button rows on Direct routes, removes separate time/status tokens, handles group sender prefixes, recognizes explicit unread semantics and constrained unread-dot/contrasting typography layouts, and rejects compose controls, outgoing previews and ambiguous same-name button rows. A known row changing from unknown/read to unread with a changed preview is incoming evidence. Baselines and rerenders remain silent. Stable local conversation keys let rows without an href supply content without inventing a thread navigation URL.
+
+Badge events now wait for one strong matching inbox delta. Late higher-priority generic payloads preserve already-extracted names and text. Badge/native receipt requests an immediate inbox DOM snapshot to reduce background timer delay. Preview-only edits still need independent native/page confirmation, and multiple competing changes do not arbitrarily choose a sender.
+
+`DirectMonitorExtraction` logs only counts: `rowCount*1000000 + namedCount*10000 + previewCount*100 + unreadCount`. No extracted name, message or conversation key is logged.
+
+Validation: 99 core notification checks passed. `node scripts/test-direct-inbox-dom.cjs --dom --notifications` passed 37 DOM fixtures, including primary-bridge payloads and hidden-monitor snapshots; this mode uses jsdom with explicit fixture geometry, not real browser rendering. JavaScript syntax checks passed. Full WebView integration again hit sandbox browser subprocess crashes. Automatic approval service HTTP 503 prevented reading the actual app UI and launching browser tests outside that restriction, so actual current-account DOM and real Windows banners remain unverified.
+
+The new self-contained build is in `publish/sender-preview/InstaDesktop.exe`; the already-running `publish/win-x64` copy cannot pick up changes until exited. Exit through the tray menu before launching the new build: the single-instance guard otherwise reactivates the old process. Real-account verification should show a nonzero extraction row/name/preview count, then a detailed notification for a new incoming message. Layouts with no readable preview, ambiguous identity, or no observable incoming state still fall back to generic text. Button rows without a genuine href restore the window when clicked.
+
+## Background notification recovery (2026-09-14, late evening)
+
+The running `sender-preview` build read 14–16 conversation names and previews but reported zero recognized unread rows. Later logs showed badge notifications submitted to Windows while detail enrichment timed out. The user reported missed notifications on Home/Reels or in the tray. These logs do not establish the actual unread markup or prove every preview change is incoming.
+
+The primary bridge now gives the global Messages badge an independent settled baseline, retains it across SPA routes and temporary missing navigation, and settles decreases to avoid replaying old counts during navigation rebuilding. Optional row extraction exceptions no longer abort badge delivery or prevent creation of the safety timer. Hidden-monitor extraction failures invalidate stale details and recover with a silent baseline.
+
+For a continuously observed row whose unread state remains unknown, a real preview delta now retains its name/body as weak evidence. It stays silent on its own. Exactly one nearby badge increase can confirm it only after the full two-second coordinator window, with exactly one candidate and no competing changes. Explicitly read rows and known-unread edits still cannot use badge confirmation. Outgoing previews are ignored; transitions from outgoing previews require native/page confirmation. Appearing/disappearing conversations, or another row becoming unread with identical text, veto anonymous attribution. This remains temporal correlation rather than a server message identifier; simultaneous invisible changes, unrendered rows, identical repeated previews and saturated badges limit detail recovery.
+
+Diagnostics remain free of private message data. `DirectMonitorUnreadState` encodes `unreadRows*10000 + readRows*100 + unknownRows`; `DirectMonitorUncertainChange` records ambiguity and `DirectMonitorExtractionFailed` records monitor extraction failure. Primary `rows-unavailable` maps to `NotificationDiagnostic Code=70001` once per continuous failure.
+
+The regression first failed on unknown-unread preview preservation (`background-notifications-before.json`). Five badge regressions also failed before the JavaScript fix: initial/later extractor exceptions, continuous row churn, SPA changes and temporary missing navigation. The final core suite adds state, ambiguity, outgoing, recovery and both event orders. The asynchronous delivery test waits for actual presentation within a bounded deadline instead of depending on a fixed 250 ms dispatcher allowance. The DOM suite passes 49 checks using jsdom fixture geometry, including hidden-observer failure and recovery.
+
+The new self-contained builds are `publish/background-notifications/InstaDesktop.exe` and `publish/background-notifications-single-file/InstaDesktop.exe`; each passed 124 core checks. Core reports are `artifacts/verification/background-notifications-release-core.json` and `background-notifications-single-file-core.json`. Publishing emits NU1900 because the restricted environment cannot reach NuGet's vulnerability service. Real signed-in Windows notification delivery has not been verified: desktop window discovery and the authorized launch of the new build were rejected by automatic approval review with HTTP 503. The old process exited independently before the launch attempt; automation did not start the new process.
+
+## Activity tile extraction defect (2026-09-14, 23:35 report)
+
+The current `background-notifications` executable still submitted generic badge notifications. Its only detailed candidates occurred about one minute apart with `Code=400142`: a 14-character preview, an avatar, and no sender field or thread URL. Badge events had no nearby detail and timed out. The candidate count therefore does not prove that the real DM conversation rows were read.
+
+A DOM regression reproduced an exact matching shape: the avatar button `Alice / Active 10m ago` was accepted, and changing its online status to `Active 11m ago` produced a different 14-character preview. This is a confirmed extractor defect and a strong explanation for the observed cadence, but the actual account DOM has not been inspected. The first-pass inferred button extractor now excludes status-only text; explicit preview fields and canonical thread URLs still preserve messages whose literal contents use that wording. Six added regressions pass, bringing the DOM suite to 55. The first new regression failed before the fix. The targeted build is `publish/inbox-status-fix/InstaDesktop.exe`.
+
+This correction removes false evidence; it does not establish that the current account's real conversation rows are supported. Browser inventory was also blocked by automatic approval review HTTP 503. A screenshot of the actual inbox conversation list is needed to identify the missing row structure before declaring sender/content recovery successful. No correlation window or incoming-evidence requirement was loosened in this patch.
+
+## Hidden monitor permission and native lifetime repair (2026-09-29)
+
+Causes. (1) `DirectInboxMonitor` answered every `PermissionRequested` with Deny, including Instagram Notifications while AppNotifications was on. Whenever the shared profile was not already Allow (never synchronized, reset, or synchronization failed), the background inbox could never obtain Notification permission, so the only page able to raise a native event while the primary is on another route produced none, and preview-only inbox evidence waiting for native confirmation was never shown. The integration test masked this by calling `SetPermissionStateAsync(...Allow)` itself. (2) Native `CoreWebView2Notification` objects from a monitor were kept after its controller closed (route block, renderer crash, restart). A later toast click, dismissal, one-day expiry, 64-entry eviction or primary reinitialization called `ReportClicked`/`ReportClosed` on a closed controller: an uncatchable `AccessViolationException` that terminated the app.
+
+Fixes. `NotificationPermissionPolicy` is the single owner of the rules. The monitor allows Notifications only for the exact www/root Instagram origins while AppNotifications is on, saving the grant like the settings sync does; a denial is request-only so the background page never overwrites the profile, and every other permission/origin stays denied with no dialog. The settings sync targets exact origins, re-applies if the setting changes mid-sync, and logs the stored state (`NotificationPermissionState`, www + 10 × root). Monitor handlers are named and detached on dispose; native lifetimes record their owning controller and are released before that controller closes (and on primary renderer failure). Native events raised by both the primary page and the monitor for one message collapse into one delivery. The Windows presenter logs `CreateToastNotifier().Setting` on startup and every show, names each system disable reason, treats an unreadable setting as "attempt Show", and separates Show exceptions (`WindowsNotificationShowFailed`) from `ToastNotification.Failed` (`WindowsNotificationDeliveryFailed`). No tray balloon substitutes for a toast.
+
+Tests (`Diagnostics/NotificationMonitorPermissionTests.cs`). No WebView check grants permission from the test: the monitor starts from an ungranted profile and must obtain Allow through its own handler; disabled mode must deny without persisting and show neither browser UI nor a toast. The real `WebViewService` path is exercised with the primary on Reels, primary/monitor mirrored events, concurrent refreshes, SPA routes, monitor route block and restart, monitor renderer crash, primary reinitialization, setting off/on, restart over a stale denied profile, and permission reset. The real toast presenter is exercised through a notifier adapter (enabled, each disable reason, unreadable setting, Show exception, Failed, timeout) without registering a toast.

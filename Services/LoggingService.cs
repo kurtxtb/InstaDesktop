@@ -13,13 +13,24 @@ public enum LogEvent
     NotificationBaseline, NotificationDiagnostic, NotificationRejected, NotificationRegistered,
     NotificationInitializationFailed, NotificationImageFailed, NotificationLifecycleFailed,
     WindowsNotificationRequested, WindowsNotificationSubmitted, WindowsNotificationUnavailable,
-    WindowsNotificationFailed, NotificationActivated, NotificationActivationFailed, NotificationNavigated
+    WindowsNotificationFailed, NotificationActivated, NotificationActivationFailed, NotificationNavigated,
+    DirectMonitorStarted, DirectMonitorReady, DirectMonitorBaselineCreated, DirectSnapshotChanged,
+    DirectCandidateCreated, NativeCandidateAwaitingEnrichment, NativeCandidateEnriched,
+    EnrichmentTimedOut, EnrichmentAmbiguous, DirectMonitorNavigationReset, DirectMonitorInitializationFailed,
+    DirectMonitorExtraction, DirectMonitorUnreadState, DirectMonitorUncertainChange, DirectMonitorExtractionFailed,
+    NotificationPermissionState, DirectMonitorPermission, DirectMonitorStopped,
+    WindowsNotificationSetting, WindowsNotificationSettingUnavailable, WindowsNotificationDisabledForApplication,
+    WindowsNotificationDisabledForUser, WindowsNotificationDisabledByGroupPolicy, WindowsNotificationDisabledByManifest,
+    WindowsNotificationShowFailed, WindowsNotificationDeliveryFailed, WindowsNotificationDismissed, NotificationColdActivation
 }
 
 public static class LoggingService
 {
     private const long MaxBytes = 512 * 1024;
     private static readonly object Gate = new();
+    // Diagnostics only: lets the isolated test runner assert which fixed event
+    // was written. Receives exactly what the log receives, never content.
+    internal static Action<LogEvent, Exception?, int?>? DiagnosticObserver;
 
     // Source + body length + presence bits only. No body, name, URL, tag or token.
     public static void Notification(LogEvent name, InstagramNotification n) =>
@@ -30,6 +41,7 @@ public static class LoggingService
     // Exception messages, stack traces, web content and URLs can contain secrets.
     public static void Write(LogEvent name, Exception? exception = null, int? code = null)
     {
+        DiagnosticObserver?.Invoke(name, exception, code);
         try
         {
             lock (Gate)

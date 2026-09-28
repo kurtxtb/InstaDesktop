@@ -38,6 +38,8 @@ Requirements: Windows 10 1809 or newer / Windows 11 x64, [.NET SDK 8.0.300+](htt
 | Installer | `publish\\installer\\InstaDesktop-Setup.exe` |
 | Single-file app | `publish\\single-file\\InstaDesktop.exe` |
 
+Building does not update an existing installation. To repair a local installation after verification, use `scripts/repair-local-install.ps1` with the actual absolute `-InstallDirectory` and existing `-ShortcutPath`; add `-WhatIf` to preview the update. It backs up replaced files and repairs the shortcut while retaining your profile, settings, and existing custom Assets.
+
 ## 🔐 Privacy
 
 Notification architecture, platform limitations, automated checks and the two-account manual checklist are documented in [NOTIFICATIONS.md](NOTIFICATIONS.md).

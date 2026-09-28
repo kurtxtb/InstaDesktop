@@ -13,26 +13,46 @@ public sealed class NotificationDeduplicator
     private readonly List<Seen> _seen = new();
     private static string Key(string? s) => Regex.Replace(s ?? "", @"\s+", " ").Trim();
 
-    public string? Find(InstagramNotification n, DateTimeOffset now)
+    public string? Find(InstagramNotification n, DateTimeOffset now, bool allowAnonymousCorrelation = true)
     {
         _seen.RemoveAll(x => now - x.At > TimeSpan.FromSeconds(30));
         foreach (var item in _seen.AsEnumerable().Reverse())
         {
             var p = item.Notification;
             if (p.Origin != n.Origin) continue;
+            if (n.ThreadUrl is null && p.ThreadUrl is null && n.ConversationKey is not null && p.ConversationKey is not null &&
+                n.ConversationKey != p.ConversationKey) continue;
+            if ((n.Source == NotificationSource.UnreadBadge && p.RequiresNativeConfirmation) ||
+                (p.Source == NotificationSource.UnreadBadge && n.RequiresNativeConfirmation)) continue;
             if (!string.IsNullOrEmpty(n.Id) && n.Id == p.Id) return item.Delivery;
             if (!string.IsNullOrEmpty(n.Id) && !string.IsNullOrEmpty(p.Id) && n.Id != p.Id) continue;
             if (n.Source == p.Source)
             {
-                if (!string.IsNullOrEmpty(n.StateSequence) && n.StateSequence == p.StateSequence && n.ThreadUrl == p.ThreadUrl)
+                if (!string.IsNullOrEmpty(n.StateSequence) && n.StateSequence == p.StateSequence &&
+                    n.ThreadUrl == p.ThreadUrl && n.ConversationKey == p.ConversationKey)
                     return item.Delivery;
                 // Tags often identify a conversation, not a message. Only collapse a
                 // tag with the same real source timestamp and payload, never tag alone.
                 if (!string.IsNullOrEmpty(n.Tag) && n.Tag == p.Tag && n.HasSourceTimestamp && p.HasSourceTimestamp &&
                     n.Timestamp == p.Timestamp && Key(n.Body) == Key(p.Body)) return item.Delivery;
+                // The primary page and the hidden inbox share one account, so both
+                // may raise the same native notification. Identical payloads from
+                // the other controller within the window are one message; a second
+                // event from the same controller remains a separate message.
+                if (n.Source == NotificationSource.NativeWebView && n.Emitter is not null && p.Emitter is not null &&
+                    n.Emitter != p.Emitter && now - item.At <= TimeSpan.FromSeconds(3) &&
+                    (n.Tag ?? "") == (p.Tag ?? "") && Key(n.Title) == Key(p.Title) && Key(n.Body) == Key(p.Body) &&
+                    !_seen.Any(x => x.Delivery == item.Delivery && x.Notification.Source == n.Source && x.Notification.Emitter == n.Emitter))
+                    return item.Delivery;
                 continue;
             }
             if (now - item.At > TimeSpan.FromSeconds(3)) continue;
+            // Inbox attribution is resolved by the coordinator after observing
+            // the complete enrichment window, never by the first anonymous hit.
+            if (!allowAnonymousCorrelation && !(NotificationPolicy.CanEnrich(n) && NotificationPolicy.CanEnrich(p)) &&
+                (n.Source == NotificationSource.UnreadBadge || p.Source == NotificationSource.UnreadBadge ||
+                 ((NotificationPolicy.CanEnrich(n) || NotificationPolicy.CanEnrich(p)) &&
+                  (n.Source >= NotificationSource.DirectDom || p.Source >= NotificationSource.DirectDom)))) continue;
             // One event per source per delivery. A second native/page event with
             // identical text is evidence of a separate message, even in this window.
             if (_seen.Any(x => x.Delivery == item.Delivery && x.Notification.Source == n.Source)) continue;
@@ -62,4 +82,12 @@ public sealed class NotificationDeduplicator
     }
 
     public void Clear() => _seen.Clear();
+
+    internal void ForgetDelivery(string delivery) => _seen.RemoveAll(x => x.Delivery == delivery);
+
+    internal void MergeDelivery(string from, string to)
+    {
+        for (int i = 0; i < _seen.Count; i++)
+            if (_seen[i].Delivery == from) _seen[i] = _seen[i] with { Delivery = to };
+    }
 }

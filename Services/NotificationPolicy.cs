@@ -7,6 +7,21 @@ namespace InstaDesktop.Services;
 
 public static class NotificationPolicy
 {
+    public static bool CanEnrich(InstagramNotification n)
+    {
+        if (!IsInstagramOrigin(n.Origin) || !string.Equals(n.Title.Trim(), "Instagram", StringComparison.OrdinalIgnoreCase) ||
+            !string.IsNullOrEmpty(n.SenderName) || n.ThreadUrl is not null || n.AvatarUrl is not null || n.ImageUrl is not null) return false;
+        // Structural guards alone cannot distinguish a DM from a branded activity
+        // alert. Keep unknown/possibly meaningful wording intact. This small,
+        // multilingual allowlist can grow from observed generic payloads.
+        return n.Body.Trim().TrimEnd('.', '!', '。', '！').ToLowerInvariant() is
+            "" or "you have a new message" or "you have a new direct message" or
+            "你有一則新訊息" or "您有一則新訊息" or "你有新訊息" or "你有一条新消息" or "你有新消息" or
+            "新しいメッセージがあります" or "새 메시지가 있습니다" or
+            "vous avez un nouveau message" or "tienes un mensaje nuevo" or "tienes un nuevo mensaje" or
+            "du hast eine neue nachricht" or "hai un nuovo messaggio" or "você tem uma nova mensagem";
+    }
+
     public static bool IsInstagramOrigin(string? value) =>
         Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == "https" &&
         uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
@@ -56,6 +71,17 @@ public static class NotificationPolicy
         Id = Clean(n.Id, 256), Tag = Clean(n.Tag, 256)
     };
 
+    internal static string? RowKey(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 240) return null;
+        if (Regex.IsMatch(value, @"\A(?:thread:[0-9]{1,64}|row:[A-Za-z0-9:_-]{1,220})\z", RegexOptions.CultureInvariant)) return value;
+        if (value.StartsWith("/direct/t/", StringComparison.Ordinal) && DirectUrl(value) is not null) return value;
+        // A unique visible conversation name is a local comparison key only.
+        // It cannot become an activation target or a Windows toast argument.
+        return value.StartsWith("name:", StringComparison.Ordinal) && value.Length > 5 &&
+            value == Clean(value, 240) ? value : null;
+    }
+
     public static bool TryParse(string origin, string json, out InstagramNotification? notification)
     {
         notification = null;
@@ -75,10 +101,12 @@ public static class NotificationPolicy
             if (source is null) return false;
             string? sequence = Text(root, "sequence", 100);
             string? thread = Text(root, "threadUrl", 256);
+            string? rowKey = Text(root, "rowKey", 240);
             if (thread is not null && DirectUrl(thread) is null) return false;
+            if (rowKey is not null && RowKey(rowKey) is null) return false;
             if (source >= NotificationSource.DirectDom &&
                 (!root.TryGetProperty("unread", out var unread) || unread.ValueKind != JsonValueKind.True || string.IsNullOrEmpty(sequence))) return false;
-            if (source == NotificationSource.DirectDom && thread is null) return false;
+            if (source == NotificationSource.DirectDom && thread is null && rowKey is null) return false;
             notification = Normalize(new InstagramNotification
             {
                 Source = source.Value, Origin = new Uri(origin).GetLeftPart(UriPartial.Authority),
@@ -87,6 +115,7 @@ public static class NotificationPolicy
                 Title = source == NotificationSource.UnreadBadge ? "Instagram" : Text(root, "title", 160) ?? "Instagram",
                 Body = source == NotificationSource.UnreadBadge ? "You have a new message" : Text(root, "body", 1000) ?? "You have a new message",
                 SenderName = Text(root, "senderName", 160), ThreadUrl = thread,
+                ConversationKey = rowKey,
                 AvatarUrl = Text(root, "avatarUrl", 4096), ImageUrl = Text(root, "imageUrl", 4096),
                 Silent = root.TryGetProperty("silent", out var silent) && silent.ValueKind == JsonValueKind.True
             });
