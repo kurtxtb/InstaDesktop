@@ -20,14 +20,25 @@
   const statusText = value => /^(?:active now|active (?:today|yesterday)|active \d+\s*(?:m|h|d|minutes?|hours?|days?) ago|目前在線上|目前在线|剛剛上線|在线|在線上|\d+\s*(?:分鐘|分钟|小時|小时|天)前(?:在線上|在线|上線)|オンライン中)$/i.test(value);
   const unreadText = value => /^(?:unread(?: messages?)?|未讀(?:訊息)?|未读(?:消息)?|未読(?:メッセージ)?)$/i.test(value);
   const outgoingText = value => /^(?:(?:you|你|您)\s*[:：]|(?:你|您)(?:傳送了|发送了|傳送|发送|回覆了|回复了)|you (?:sent|replied|reacted)\b)/i.test(value);
+  // A transient typing indicator replaces the preview; it is neither a message
+  // nor a reason for the row to disappear from the snapshot.
+  const typingText = value => /^(?:typing(?:\s*(?:\.{2,3}|…))?|.{1,80}\s+is\s+typing\s*(?:\.{2,3}|…)|(?:正在輸入|正在输入|輸入中|入力中)(?:\s*(?:\.{2,3}|…))?)$/i.test(value);
+  // With several unread messages Instagram summarizes the preview instead of
+  // showing the text. The number is a real unread counter for that row.
+  const newMessagesCount = value => {
+    const match = value.match(/^(\d{1,4})\+?\s*(?:new messages?|則新訊息|条新消息|件の新しいメッセージ)$/i);
+    return match ? Number(match[1]) : null;
+  };
   const controlText = value => /^(?:new message|create (?:a )?message|compose|search|suggested(?: for you)?|suggestions|people you may know|contacts|follow|message requests|新增訊息|新訊息|撰寫訊息|搜尋|搜索|推薦|推荐|建議|聯絡人|联系人|追蹤|关注|訊息邀請)$/i.test(value);
 
   function parseLines(rawLines) {
     const lines = rawLines.map(line => clean(line)).filter(Boolean);
     // Metadata must be a separate trailing token (or follow a middle-dot
     // separator). A message whose entire text is "now" remains a message.
-    let metadata = false;
+    let metadata = false, unreadLabel = false;
     while (lines.length > 2 && (timeText(lines.at(-1)) || statusText(lines.at(-1)) || unreadText(lines.at(-1)) || /^[·•]$/.test(lines.at(-1)))) {
+      // A visually hidden trailing "Unread" line is the row's accessible state.
+      if (unreadText(lines.at(-1))) unreadLabel = true;
       lines.pop(); metadata = true;
     }
     if (lines.length > 2 && statusText(lines[1])) { lines.splice(1, 1); metadata = true; }
@@ -38,7 +49,7 @@
     if (suffix && (timeText(suffix[1].trim()) || statusText(suffix[1].trim()))) {
       preview = preview.slice(0, suffix.index); metadata = true;
     }
-    return { conversationName, preview: clean(preview), metadata };
+    return { conversationName, preview: clean(preview), metadata, unreadLabel };
   }
 
   function textNode(row, text) {
@@ -77,7 +88,11 @@
   function unreadDot(row) {
     const bounds = row.getBoundingClientRect();
     return [...row.querySelectorAll('div,span,i')].some(node => {
-      if (node.childElementCount || clean(node.textContent) || !visible(node) || node.closest('svg')) return false;
+      if (!visible(node) || node.closest('svg')) return false;
+      // The dot may carry a visually hidden label (e.g. "Unread"); any direct
+      // text or visibly sized content means this is not a bare indicator.
+      if ([...node.childNodes].some(child => child.nodeType === 3 && clean(child.textContent))) return false;
+      if ([...node.querySelectorAll('*')].some(child => { const r = child.getBoundingClientRect(); return r.width > 2 && r.height > 2; })) return false;
       const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
       if (rect.width < 3 || rect.width > 14 || rect.height < 3 || rect.height > 14 || Math.abs(rect.width - rect.height) > 2 ||
           rect.left < bounds.right - Math.min(80, bounds.width * .35) || rect.right > bounds.right + 1 ||
@@ -114,8 +129,12 @@
       .find(node => visible(node) && (clean(node.innerText || node.textContent).startsWith(preview + ' ') ||
         String(node.innerText || '').split(/\r?\n/).map(line => clean(line)).includes(preview))) || null;
     const state = explicitUnread(row);
+    if (state.isUnread === null && parsed?.unreadLabel) state.isUnread = true;
     const dot = state.isUnread === null && unreadDot(row);
     if (dot) state.isUnread = true;
+    const summary = newMessagesCount(preview);
+    if (state.unreadCount === null && summary !== null && state.isUnread !== false) { state.unreadCount = summary; state.isUnread = summary > 0; }
+    const typing = typingText(preview);
     const nameWeight = nameNode ? parseInt(getComputedStyle(nameNode).fontWeight, 10) : NaN;
     const previewWeight = previewNode ? parseInt(getComputedStyle(previewNode).fontWeight, 10) : NaN;
     const bold = nameWeight >= 600 && previewWeight >= 600;
@@ -126,7 +145,7 @@
     const structuredMessage = preview.length >= 2 && !/^@?[\w.]+$/.test(preview) &&
       !/^(?:followed by|suggested for you|follows you|追蹤你|关注了你|推薦給你|推荐给你)/i.test(preview);
     if (!threadUrl && !(explicitName && explicitPreview) &&
-        (!nameNode || !previewNode || (!knownList && !parsed?.metadata && !row.querySelector('time') && state.isUnread === null && !bold && !structuredMessage))) return null;
+        (!nameNode || !previewNode || (!knownList && !parsed?.metadata && !row.querySelector('time') && state.isUnread === null && !bold && !structuredMessage && !typing))) return null;
     const direction = explicitPreview?.getAttribute('data-message-direction') ?? row.getAttribute('data-message-direction');
     const own = explicitPreview?.getAttribute('data-is-own-message') ?? row.getAttribute('data-is-own-message');
     const outgoing = direction === 'outgoing' || own === 'true' || outgoingText(preview);
@@ -140,7 +159,7 @@
     return { node: row, bold, normal, value: { threadUrl, rowKey: threadUrl || 'name:' + identity,
       conversationName, preview: messagePreview, senderName,
       avatarUrl: images.length === 1 ? clean(images[0].currentSrc || images[0].src, 4096) : '',
-      ...state, outgoing } };
+      ...state, outgoing, typing } };
   }
 
   function readRows() {
@@ -150,9 +169,14 @@
     // Prefer the innermost complete row; a nested avatar button is incomplete
     // and therefore does not suppress its containing conversation row.
     candidates = candidates.filter(row => !candidates.some(other => row !== other && row.node.contains(other.node)));
-    const sameList = (a, b) => a.node.parentElement === b.node.parentElement ||
-      (a.node.parentElement?.childElementCount === 1 && b.node.parentElement?.childElementCount === 1 &&
-       a.node.parentElement?.parentElement === b.node.parentElement?.parentElement);
+    // Instagram wraps each row in several single-child layout elements; the
+    // list is the first ancestor holding more than one child.
+    const listOf = node => {
+      let current = node;
+      for (let i = 0; i < 6 && current.parentElement && current.parentElement.childElementCount === 1; i++) current = current.parentElement;
+      return current.parentElement;
+    };
+    const sameList = (a, b) => { const list = listOf(a.node); return !!list && list === listOf(b.node); };
     // Once another row establishes this container as a conversation list, a
     // short single-word preview is valid too. This keeps "Hi" as an initial
     // baseline without mistaking a lone contact suggestion for a conversation.

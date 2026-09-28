@@ -143,6 +143,7 @@ internal static class NotificationTestRunner
             NotificationInboxEvidenceTests.Run(Check);
             await NotificationBadgeEnrichmentTests.RunAsync(window.Dispatcher, Check);
             await NotificationUnknownUnreadTests.RunAsync(window.Dispatcher, Check);
+            await NotificationInboxRealDomTests.RunAsync(window.Dispatcher, Check);
             NotificationMonitorPermissionTests.RunCore(Check);
             await NotificationMonitorPermissionTests.RunMirrorAsync(window.Dispatcher, Check);
             await NotificationMonitorPermissionTests.RunPresenterAsync(window.Dispatcher, Check);

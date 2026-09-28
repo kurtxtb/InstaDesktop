@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Threading;
@@ -237,13 +238,25 @@ internal sealed class DirectInboxMonitor : IDisposable
     {
         private sealed record Row(InstagramNotification Value, bool? Unread, int? Count, bool Outgoing);
         private Dictionary<string, Row>? _previous;
+        // Rows seen recently in this document. React briefly drops and re-adds a
+        // row (typing indicator, reordering); its return is compared with its last
+        // real state instead of being treated as a newly discovered conversation.
+        private readonly Dictionary<string, (Row Row, DateTimeOffset Seen)> _recent = new(StringComparer.Ordinal);
+        internal static TimeSpan RecentRowLifetime = TimeSpan.FromMinutes(2);
         private string? _document;
         private long _sequence;
         private int _extractionCode = -1;
         private int _unreadStateCode = -1;
         public bool Ready => _previous is not null;
         public bool UncertainChange { get; private set; }
-        public void Reset() { _previous = null; _document = null; _sequence = 0; _extractionCode = _unreadStateCode = -1; UncertainChange = false; }
+        public void Reset() { _previous = null; _recent.Clear(); _document = null; _sequence = 0; _extractionCode = _unreadStateCode = -1; UncertainChange = false; }
+
+        private Row? Known(string key, string epoch, DateTimeOffset now)
+        {
+            if (_document != epoch) return null;
+            if (_previous is not null && _previous.TryGetValue(key, out var row)) return row;
+            return _recent.TryGetValue(key, out var recent) && now - recent.Seen <= RecentRowLifetime ? recent.Row : null;
+        }
 
         public IReadOnlyList<InstagramNotification> Apply(string origin, string json)
         {
@@ -256,6 +269,7 @@ internal sealed class DirectInboxMonitor : IDisposable
             if (!Guid.TryParse(epoch, out _) || !root.GetProperty("sequence").TryGetInt64(out long sequence) || sequence <= 0) throw new JsonException();
             if (root.GetProperty("ready").ValueKind == JsonValueKind.False) { Reset(); return Array.Empty<InstagramNotification>(); }
             if (root.GetProperty("ready").ValueKind != JsonValueKind.True) throw new JsonException();
+            var now = DateTimeOffset.UtcNow;
             var threads = root.GetProperty("threads");
             if (threads.ValueKind != JsonValueKind.Array || threads.GetArrayLength() > 40) throw new JsonException();
             var current = new Dictionary<string, Row>(StringComparer.Ordinal);
@@ -273,6 +287,13 @@ internal sealed class DirectInboxMonitor : IDisposable
                 var countValue = item.GetProperty("unreadCount");
                 int? count = countValue.ValueKind == JsonValueKind.Null ? null : countValue.GetInt32();
                 if (count is < 0 or > 9999 || (count is not null && unread is not null && unread != (count > 0))) throw new JsonException();
+                bool typing = item.TryGetProperty("typing", out var typingValue) && typingValue.ValueKind == JsonValueKind.True;
+                if (typing)
+                {
+                    // Keep the last real state; an unknown row simply waits.
+                    if (Known(url ?? key!, epoch, now) is { } known && !current.TryAdd(url ?? key!, known)) throw new JsonException();
+                    continue;
+                }
                 if (preview.Length > 0 && sender.Length > 0 && sender != title && !preview.StartsWith(sender + ":", StringComparison.Ordinal)) preview = sender + ": " + preview;
                 var value = NotificationPolicy.Normalize(new InstagramNotification
                 {
@@ -309,11 +330,15 @@ internal sealed class DirectInboxMonitor : IDisposable
                 foreach (var (url, row) in current)
                 {
                     if (row.Outgoing) continue;
-                    _previous.TryGetValue(url, out var old);
+                    var old = Known(url, epoch, now);
+                    // A briefly missing row is compared with its last state only
+                    // when its unread markup is readable; otherwise it baselines
+                    // again like a virtualized row, without fabricated detail.
+                    bool recalled = old is not null && !_previous.ContainsKey(url);
                     // Newly loaded rows may be historical or genuinely incoming.
                     // They cannot provide a detail candidate, but they can compete
                     // with an unrelated edit for an anonymous badge's identity.
-                    if (old is null) { UncertainChange = true; continue; }
+                    if (old is null || (recalled && row.Unread is null)) { UncertainChange = true; continue; }
                     bool previewChanged = old is not null && old.Value.Body != row.Value.Body;
                     if (row.Unread is null)
                     {
@@ -334,8 +359,11 @@ internal sealed class DirectInboxMonitor : IDisposable
                         continue;
                     }
                     if (row.Unread == false) { UncertainChange |= previewChanged; continue; }
+                    // An already-unread row whose preview becomes an "N new messages"
+                    // summary (N >= 2) received another message.
                     bool strong = old is not null && !old.Outgoing &&
-                        ((old.Unread != true && previewChanged) || (old.Count is not null && row.Count > old.Count));
+                        ((old.Unread != true && previewChanged) || (old.Count is not null && row.Count > old.Count) ||
+                         (old.Unread == true && old.Count is null && row.Count >= 2 && previewChanged));
                     // Newly discovered/virtualized rows always baseline silently.
                     // Preview-only changes require a nearby native confirmation.
                     if (strong || previewChanged)
@@ -344,6 +372,9 @@ internal sealed class DirectInboxMonitor : IDisposable
                 }
             }
             else LoggingService.Write(LogEvent.DirectMonitorBaselineCreated, code: current.Count);
+            if (_document != epoch) _recent.Clear();
+            foreach (var (key, row) in current) _recent[key] = (row, now);
+            foreach (var stale in _recent.Where(x => now - x.Value.Seen > RecentRowLifetime).Select(x => x.Key).ToArray()) _recent.Remove(stale);
             _previous = current; _document = epoch; _sequence = sequence;
             if (changes.Count > 0) LoggingService.Write(LogEvent.DirectSnapshotChanged, code: changes.Count);
             if (UncertainChange) LoggingService.Write(LogEvent.DirectMonitorUncertainChange);

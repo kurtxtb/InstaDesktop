@@ -59,6 +59,8 @@
     try {
       for (const row of window.__InstaDesktopInboxDom?.readRows() || []) {
         if (!row || typeof row.rowKey !== 'string') continue;
+        // "Typing..." is transient: keep the last real preview as the baseline.
+        if (row.typing) { if (rows.has(row.rowKey)) present.add(row.rowKey); continue; }
         const current = { path: row.threadUrl, key: row.rowKey, unread: row.isUnread, count: row.unreadCount,
           title: row.conversationName, preview: row.preview, sender: row.senderName, avatar: row.avatarUrl, outgoing: row.outgoing };
         if (!current || present.has(current.key)) continue;

@@ -91,7 +91,10 @@ public partial class MainWindow : Window
         CreateTray();
         if (((App)Application.Current).DiagnosticMode)
         {
-            if (((App)Application.Current).NotificationTest)
+            if (((App)Application.Current).InboxDiagnostics)
+                await Diagnostics.InboxDiagnosticsRunner.RunAsync(this, _settings, ((App)Application.Current).DiagnosticOutput!,
+                    ((App)Application.Current).InboxDiagnosticSeconds);
+            else if (((App)Application.Current).NotificationTest)
                 await Diagnostics.NotificationTestRunner.RunAsync(this, _settings, ((App)Application.Current).DiagnosticOutput!);
             else if (((App)Application.Current).WindowLayoutTest)
                 await Diagnostics.WindowLayoutTestRunner.RunAsync(this, ((App)Application.Current).DiagnosticOutput!);

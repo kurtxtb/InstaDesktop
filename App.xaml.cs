@@ -20,6 +20,9 @@ public partial class App : Application
     internal bool DiagnosticMode { get; private set; }
     internal bool WindowLayoutTest { get; private set; }
     internal bool NotificationTest { get; private set; }
+    // Real signed-in profile, redacted report only; see InboxDiagnosticsRunner.
+    internal bool InboxDiagnostics { get; private set; }
+    internal int InboxDiagnosticSeconds { get; private set; } = 180;
     internal string? DiagnosticOutput { get; private set; }
     public SettingsService Settings { get; } = new();
 
@@ -48,6 +51,13 @@ public partial class App : Application
                 diagnosticIndex = Array.IndexOf(e.Args, "--notification-test");
                 NotificationTest = DiagnosticMode = diagnosticIndex >= 0;
             }
+            if (!DiagnosticMode)
+            {
+                diagnosticIndex = Array.IndexOf(e.Args, "--inbox-diagnostics");
+                InboxDiagnostics = DiagnosticMode = diagnosticIndex >= 0;
+                if (InboxDiagnostics && diagnosticIndex + 2 < e.Args.Length && int.TryParse(e.Args[diagnosticIndex + 2], out int seconds))
+                    InboxDiagnosticSeconds = Math.Clamp(seconds, 30, 900);
+            }
             if (e.Args.Contains("--uninstall-notifications"))
             {
                 WindowsNotificationService.Uninstall();
@@ -58,7 +68,18 @@ public partial class App : Application
             {
                 if (diagnosticIndex + 1 >= e.Args.Length) { Shutdown(2); return; }
                 DiagnosticOutput = Path.GetFullPath(e.Args[diagnosticIndex + 1]);
-                AppPaths.UseDiagnosticRoot(Path.Combine(Path.GetDirectoryName(DiagnosticOutput)!,
+                // Inbox diagnostics need the signed-in profile, so it must own the
+                // single-instance lock instead of sharing the profile with the app.
+                if (InboxDiagnostics)
+                {
+                    if (!AcquireInstance())
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(DiagnosticOutput)!);
+                        File.WriteAllText(DiagnosticOutput, "{\"success\":false,\"failure\":\"Close InstaDesktop (including the tray icon) first.\"}");
+                        Shutdown(3); return;
+                    }
+                }
+                else AppPaths.UseDiagnosticRoot(Path.Combine(Path.GetDirectoryName(DiagnosticOutput)!,
                     "profile-" + Guid.NewGuid().ToString("N")));
             }
             else if (!AcquireInstance()) { Shutdown(); return; }

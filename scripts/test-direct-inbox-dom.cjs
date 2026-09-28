@@ -113,6 +113,29 @@ const row = (name, preview, opts = {}) => {
     check('mark-as-unread action is not unread evidence', () => assert.equal(rows[0].isUnread, null));
     rows = await fixture(row('Alice', 'Hello', { attrs: 'aria-label="Alice, unread message"' }));
     check('supplementary accessibility unread state is recognized', () => assert.equal(rows[0].isUnread, true));
+    // Current Instagram layout (2026-09 redacted diagnostics): each row sits in
+    // three single-child wrappers inside the list, unread rows are semibold and
+    // carry an 8px blue dot holding a visually hidden "Unread" label.
+    const wrap = html => '<div><div><div>' + html + '</div></div></div>';
+    const hiddenLabel = text => '<div style="width:1px;height:1px">' + text + '</div>';
+    rows = await fixture(wrap(row('Alice', 'See you soon', { bold: true })) + wrap(row('Bob', 'Old message')));
+    check('wrapped rows pair semibold unread with normal read typography', () => {
+      assert.equal(rows.length, 2); assert.equal(rows[0].isUnread, true); assert.equal(rows[1].isUnread, false);
+    });
+    rows = await fixture(wrap(row('Alice', 'Hi', { bold: true, dot: true }).replace('<span class="dot"></span>', '<span class="dot" data-visualcompletion="css-img">' + hiddenLabel('Unread') + '</span>')) + wrap(row('Bob', 'Old message')));
+    check('unread dot with visually hidden label is recognized', () => { assert.equal(rows[0].isUnread, true); assert.equal(rows[0].preview, 'Hi'); });
+    rows = await fixture(row('Alice', 'Hi', { dot: true }).replace('<span class="dot"></span>', '<span class="dot">' + hiddenLabel('') + '</span>'));
+    check('unread dot containing an empty hidden child still counts', () => assert.equal(rows[0].isUnread, true));
+    rows = await fixture(row('Alice', 'Hi', { dot: true }).replace('<span class="dot"></span>', '<span class="dot"><div style="width:40px;height:40px"></div></span>'));
+    check('visible content inside a dot-sized element is not an unread dot', () => assert.equal(rows[0].isUnread, null));
+    rows = await fixture(wrap(row('Alice', 'Typing...', { time: false })) + wrap(row('Bob', 'Old message')));
+    check('typing indicator keeps the row in the snapshot and is flagged', () => {
+      assert.equal(rows.length, 2); assert.equal(rows[0].typing, true); assert.equal(rows[1].typing, false);
+    });
+    rows = await fixture(wrap(row('Alice', 'stop typing', { time: false })) + wrap(row('Bob', 'Old message')));
+    check('a message mentioning typing is not an indicator', () => assert.equal(rows[0].typing, false));
+    rows = await fixture(wrap(row('Alice', '2 new messages', { bold: true, dot: true })) + wrap(row('Bob', 'Old message')));
+    check('new-message summary becomes an unread counter', () => { assert.equal(rows[0].unreadCount, 2); assert.equal(rows[0].isUnread, true); });
     await fixture(row('Alice', 'Old message', { attrs: 'data-unread="false"' }));
     await page.evaluate("window.chrome={webview:{postMessage:value=>window.__fixtureMessages.push(value)}};window.__fixtureMessages=[];window.__InstaDesktopNotificationsEnabled=true;");
     await page.evaluate(fs.readFileSync(path.join(__dirname, '../Assets/Scripts/notifications.js'), 'utf8'));
@@ -261,6 +284,21 @@ const row = (name, preview, opts = {}) => {
       await new Promise(resolve => setTimeout(resolve, 550));
       const outgoing = await page.evaluate(() => window.__fixtureMessages.filter(value => value.type === 'instadesktop:notification'));
       check('primary observer suppresses outgoing button preview', () => assert.equal(outgoing.length, 0));
+      await page.evaluate(() => window.__InstaDesktopNotifications.setEnabled(false));
+      // Real layout: typing replaces the preview, then the message arrives.
+      await fixture('<div><div><div>' + row('Alice', 'Earlier preview') + '</div></div></div><div><div><div>' + row('Bob', 'Old message') + '</div></div></div>');
+      await page.evaluate(() => { window.__fixtureMessages = []; window.chrome = { webview: { postMessage: value => window.__fixtureMessages.push(value) } }; });
+      await page.evaluate(fs.readFileSync(path.join(__dirname, '../Assets/Scripts/notifications.js'), 'utf8'));
+      await page.evaluate(() => window.__InstaDesktopNotifications.setEnabled(true));
+      await new Promise(resolve => setTimeout(resolve, 1150));
+      await page.evaluate(() => { window.__fixtureMessages = []; document.querySelector('.row .preview').textContent = 'Typing...'; });
+      await new Promise(resolve => setTimeout(resolve, 550));
+      await page.evaluate(() => { const node = document.querySelector('.row'); node.classList.add('bold'); node.querySelector('.preview').textContent = 'Real message'; node.insertAdjacentHTML('beforeend', '<span class="dot"></span>'); });
+      await new Promise(resolve => setTimeout(resolve, 550));
+      const afterTyping = await page.evaluate(() => window.__fixtureMessages.filter(value => value.type === 'instadesktop:notification'));
+      check('primary observer ignores typing and emits the following message once', () => {
+        assert.equal(afterTyping.length, 1); assert.equal(afterTyping[0].title, 'Alice'); assert.equal(afterTyping[0].body, 'Real message');
+      });
       await page.evaluate(() => window.__InstaDesktopNotifications.setEnabled(false));
       await fixture(row('Alice', 'Background preview', { dot: true }));
       await page.evaluate(() => { window.__fixtureMessages = []; window.chrome = { webview: { postMessage: value => window.__fixtureMessages.push(value) } }; });
