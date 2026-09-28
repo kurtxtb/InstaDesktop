@@ -145,6 +145,7 @@ internal static class NotificationTestRunner
             await NotificationUnknownUnreadTests.RunAsync(window.Dispatcher, Check);
             await NotificationInboxRealDomTests.RunAsync(window.Dispatcher, Check);
             NotificationMonitorPermissionTests.RunCore(Check);
+            UpdateTests.Run(Check);
             await NotificationMonitorPermissionTests.RunMirrorAsync(window.Dispatcher, Check);
             await NotificationMonitorPermissionTests.RunPresenterAsync(window.Dispatcher, Check);
             if (Environment.GetCommandLineArgs().Contains("--notification-core-only")) return;

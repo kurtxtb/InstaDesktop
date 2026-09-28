@@ -21,7 +21,8 @@ public enum LogEvent
     NotificationPermissionState, DirectMonitorPermission, DirectMonitorStopped,
     WindowsNotificationSetting, WindowsNotificationSettingUnavailable, WindowsNotificationDisabledForApplication,
     WindowsNotificationDisabledForUser, WindowsNotificationDisabledByGroupPolicy, WindowsNotificationDisabledByManifest,
-    WindowsNotificationShowFailed, WindowsNotificationDeliveryFailed, WindowsNotificationDismissed, NotificationColdActivation
+    WindowsNotificationShowFailed, WindowsNotificationDeliveryFailed, WindowsNotificationDismissed, NotificationColdActivation,
+    UpdateCheck, UpdateUnavailable, UpdateAvailable, UpdateVerificationFailed, UpdateLaunched
 }
 
 public static class LoggingService

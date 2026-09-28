@@ -15,15 +15,38 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          # Match global.json (8.0.300, latestPatch) instead of the newest 8.0 band.
+          global-json-file: global.json
       - uses: nuget/setup-nuget@v2
+      - name: Check version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content InstaDesktop.csproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "InstaDesktop.csproj version v$version does not match tag ${{ github.ref_name }}" }
       - name: Publish
-        run: dotnet publish InstaDesktop.csproj -c Release -r win-x64 --self-contained true -p:PublishProfile=Stable
+        run: dotnet publish InstaDesktop.csproj -c Release -p:PublishProfile=Stable
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
       - name: Build installer
         shell: cmd
         run: build-installer.bat --no-pause
+      - name: Checksums and release notes
+        shell: pwsh
+        run: |
+          $setup = Get-Item publish/installer/InstaDesktop-Setup.exe
+          "$((Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant())  $($setup.Name)" | Set-Content publish/installer/SHA256SUMS.txt -Encoding ascii
+          $notes = ".github/release-notes/${{ github.ref_name }}.md"
+          if (-not (Test-Path $notes)) { throw "Missing $notes" }
+          (Get-Content $notes -Raw -Encoding utf8).Replace('{{SHORT_SHA}}', "${{ github.sha }}".Substring(0, 7)).Replace('{{DOTNET_SDK}}', (dotnet --version)) |
+            Set-Content publish/installer/RELEASE_NOTES.md -Encoding utf8
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: publish/installer/InstaDesktop-Setup.exe
-          generate_release_notes: true
+          name: ${{ github.ref_name }}
+          body_path: publish/installer/RELEASE_NOTES.md
+          files: |
+            publish/installer/InstaDesktop-Setup.exe
+            publish/installer/SHA256SUMS.txt

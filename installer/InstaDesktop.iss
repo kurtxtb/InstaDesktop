@@ -46,11 +46,33 @@ Name: "{autodesktop}\InstaDesktop"; Filename: "{app}\InstaDesktop.exe"; Tasks: d
 
 [Run]
 Filename: "{app}\InstaDesktop.exe"; Description: "Launch InstaDesktop"; Flags: nowait postinstall skipifsilent
+; The in-app updater runs this installer with /SILENT /RELAUNCH=1: start the new version again.
+Filename: "{app}\InstaDesktop.exe"; Flags: nowait skipifnotsilent; Check: ShouldRelaunch
 
 [UninstallRun]
 Filename: "{app}\InstaDesktop.exe"; Parameters: "--uninstall-notifications"; Flags: runhidden waituntilterminated
 
 [Code]
+function ShouldRelaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
+function InitializeSetup: Boolean;
+var
+  Waited: Integer;
+begin
+  { The updater starts this installer just before the running app exits. Give
+    it time to release its mutex instead of reporting it as still running. }
+  Waited := 0;
+  while ShouldRelaunch and CheckForMutexes('Local\InstaDesktop-Running') and (Waited < 30000) do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+  Result := True;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   StartupCommand: String;
