@@ -22,7 +22,11 @@ public enum LogEvent
     WindowsNotificationSetting, WindowsNotificationSettingUnavailable, WindowsNotificationDisabledForApplication,
     WindowsNotificationDisabledForUser, WindowsNotificationDisabledByGroupPolicy, WindowsNotificationDisabledByManifest,
     WindowsNotificationShowFailed, WindowsNotificationDeliveryFailed, WindowsNotificationDismissed, NotificationColdActivation,
-    UpdateCheck, UpdateUnavailable, UpdateAvailable, UpdateVerificationFailed, UpdateLaunched
+    UpdateCheck, UpdateUnavailable, UpdateAvailable, UpdateVerificationFailed, UpdateLaunched,
+    MediaPermission, MediaPermissionState, MediaPermissionSync, MediaPermissionPrompt, MediaPermissionCompletionFailed,
+    MediaPermissionReset, MediaPermissionMigrated, MediaPermissionBlockedNotice, MediaPrivacySettingsOpened,
+    NewWindowRequested, WindowCloseRequested, MonitorCaptureBlockFailed,
+    CallWindowOpened, CallWindowClosed, CallWindowFailed
 }
 
 public static class LoggingService

@@ -46,6 +46,17 @@ Notification architecture, platform limitations, automated checks and the two-ac
 
 InstaDesktop displays Instagram in WebView2. It does not read, store, or transmit your Instagram password; login data is managed by the WebView2 profile on your device.
 
+### Calls: microphone and camera
+
+Calls need three separate permissions: the **Allow microphone / Allow camera** switches in Settings > Calls (off by default), your answer when InstaDesktop first asks for `www.instagram.com` or `instagram.com`, and Windows' *Let desktop apps access your microphone / camera* (Settings has shortcuts). Only those two exact origins may ask.
+
+- Switch off: requests are denied for that request only (nothing is saved), a tray notice links to Settings, and any saved answer is cleared, which also stops a microphone or camera already in use.
+- Your Yes or No is remembered across restarts. To be asked again, turn the switch off and on (saving each time) or use **Reset website permissions**. The first start of this version clears a saved denial once, because older builds saved their own switch-off denials that could not be undone.
+- Calls open in their own window (a real pop-up with `window.opener`), so the main window stays usable; ending the call closes only that window.
+- The hidden background inbox page can never use the microphone or camera.
+
+`scripts/verify-media-permissions.ps1` checks this with Chromium's virtual devices in an isolated profile; it does not place calls.
+
 ## 📁 Project layout
 
 ```text

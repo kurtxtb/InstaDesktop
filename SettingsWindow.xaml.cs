@@ -1,8 +1,10 @@
 using System;
 using System.ComponentModel;
+using System.Threading.Tasks;
 using System.Windows;
 using InstaDesktop.Models;
 using InstaDesktop.Services;
+using Microsoft.Web.WebView2.Core;
 
 namespace InstaDesktop;
 
@@ -37,6 +39,48 @@ public partial class SettingsWindow : Window
         MicrophoneCheck.IsChecked = s.AllowMicrophone;
         CameraCheck.IsChecked = s.AllowCamera;
         if (!web.MemoryApiAvailable) StatusText.Text = "This WebView2 Runtime does not support low-memory mode. Normal mode is used.";
+        var version = typeof(App).Assembly.GetName().Version;
+        VersionText.Text = version is null ? "InstaDesktop" : $"InstaDesktop {version.Major}.{version.Minor}.{version.Build}";
+        SourceInitialized += (_, _) => WindowTheme.UseDarkTitleBar(this);
+        Loaded += async (_, _) => await RefreshMediaStateAsync();
+    }
+
+    private CoreWebView2PermissionState? _microphoneSite, _cameraSite;
+
+    private async Task RefreshMediaStateAsync()
+    {
+        _microphoneSite = await _web.GetMediaSiteStateAsync(CoreWebView2PermissionKind.Microphone);
+        _cameraSite = await _web.GetMediaSiteStateAsync(CoreWebView2PermissionKind.Camera);
+        ShowMediaState();
+    }
+
+    private void MediaCheck_Changed(object sender, RoutedEventArgs e) => ShowMediaState();
+
+    // Describes what the next call will do. The profile state shown is the one
+    // saved before this window's changes are applied.
+    private void ShowMediaState()
+    {
+        if (MicrophoneState is null || CameraState is null) return;
+        string Describe(bool on, bool wasOn, CoreWebView2PermissionState? site) =>
+            !on ? "Off: Instagram calls cannot use it."
+            : site is null ? ""
+            : !wasOn ? "Instagram will ask on the next call."
+            : site switch
+            {
+                CoreWebView2PermissionState.Allow => "Allowed for Instagram.",
+                CoreWebView2PermissionState.Deny => "Blocked by your earlier answer. Turn this off and on (Save each time), or reset website permissions, to be asked again.",
+                _ => "Instagram will ask on the next call."
+            };
+        MicrophoneState.Text = Describe(MicrophoneCheck.IsChecked == true, _settings.Current.AllowMicrophone, _microphoneSite);
+        CameraState.Text = Describe(CameraCheck.IsChecked == true, _settings.Current.AllowCamera, _cameraSite);
+    }
+
+    private void MicrophonePrivacy_Click(object sender, RoutedEventArgs e) => OpenPrivacy(camera: false);
+    private void CameraPrivacy_Click(object sender, RoutedEventArgs e) => OpenPrivacy(camera: true);
+    private void OpenPrivacy(bool camera)
+    {
+        if (!ShellService.OpenPrivacySettings(camera))
+            StatusText.Text = "Windows Settings could not be opened. Open Settings > Privacy & security > " + (camera ? "Camera." : "Microphone.");
     }
 
     private async void Save_Click(object sender, RoutedEventArgs e)
@@ -108,13 +152,19 @@ public partial class SettingsWindow : Window
     {
         try
         {
-            await _web.ResetPermissionsAsync();
-            StatusText.Text = "Website permissions reset. Instagram will ask again when needed.";
+            StatusText.Text = await _web.ResetPermissionsAsync() switch
+            {
+                PermissionResetResult.Reset => "Website permissions reset. Instagram will ask again when needed; a call in progress loses camera and microphone access.",
+                PermissionResetResult.NotReady => "Instagram is not loaded yet. Wait for it to load, then try again.",
+                PermissionResetResult.Unsupported => "Permission reset is unavailable. Update WebView2 Runtime and try again.",
+                _ => "Website permissions could not be reset. Check the app log and try again."
+            };
+            await RefreshMediaStateAsync();
         }
         catch (Exception error)
         {
             LoggingService.Write(LogEvent.UnexpectedException, error);
-            StatusText.Text = "Permission reset is unavailable. Update WebView2 Runtime and try again.";
+            StatusText.Text = "Website permissions could not be reset. Check the app log and try again.";
         }
     }
 }

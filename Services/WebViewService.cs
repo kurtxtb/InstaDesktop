@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,6 +16,8 @@ using Microsoft.Win32;
 using InstaDesktop.Models;
 
 namespace InstaDesktop.Services;
+
+public enum PermissionResetResult { Reset, NotReady, Unsupported, Failed }
 
 public sealed class WebViewService : IDisposable
 {
@@ -39,6 +42,27 @@ public sealed class WebViewService : IDisposable
     // monitor lifecycle against offline fixtures. Never set in normal mode.
     internal Action<CoreWebView2>? DiagnosticMonitorConfigure { get; set; }
     internal DirectInboxMonitor? DirectMonitor => _directMonitor;
+    // Diagnostics only: extra Chromium switches (virtual capture devices) for an
+    // isolated diagnostic environment, and an automated answer in place of the
+    // permission MessageBox. Both are ignored unless set by a diagnostic runner.
+    internal static string? DiagnosticBrowserArguments { get; set; }
+    internal Action<CoreWebView2>? DiagnosticCallConfigure { get; set; }
+    internal Func<IReadOnlyList<CoreWebView2PermissionKind>, string, Task<bool>>? DiagnosticPermissionPrompt { get; set; }
+    internal int PendingPermissionCount => _pendingPermissions.Count(p => !p.Completed);
+    private readonly SemaphoreSlim _mediaSync = new(1, 1);
+    private readonly List<PendingPermission> _pendingPermissions = new();
+    private readonly Dictionary<CoreWebView2PermissionKind, bool> _appliedMedia = new();
+    private readonly Dictionary<CoreWebView2PermissionKind, int> _mediaGeneration = new();
+    private readonly HashSet<CoreWebView2PermissionKind> _clearDeniedMedia = new();
+    private readonly Dictionary<CoreWebView2PermissionKind, DateTimeOffset> _lastBlockedNotice = new();
+    private bool _prompting;
+    // Live views (main page and call windows) and their document generation.
+    private readonly Dictionary<CoreWebView2, int> _documentEpochs = new();
+    private readonly List<CallWindow> _callWindows = new();
+    internal IReadOnlyList<CallWindow> CallWindows => _callWindows;
+    internal static TimeSpan BlockedNoticeInterval { get; set; } = TimeSpan.FromSeconds(60);
+    // Raised (throttled) when a call is blocked by a desktop switch that is off.
+    public event Action<CoreWebView2PermissionKind>? MediaBlocked;
     private bool MonitorAllowed => _settings.Current.AppNotifications &&
         (!_diagnosticInitialization || DiagnosticMonitorConfigure is not null);
     public WebView2? View { get; private set; }
@@ -66,6 +90,11 @@ public sealed class WebViewService : IDisposable
         _directMonitorCheck = new DispatcherTimer(TimeSpan.FromSeconds(30), DispatcherPriority.Background,
             async (_, _) => await RefreshDirectMonitorAsync(), owner.Dispatcher);
         _directMonitorCheck.Stop();
+        foreach (var kind in MediaPermissionPolicy.Kinds)
+        {
+            _appliedMedia[kind] = MediaPermissionPolicy.Enabled(settings.Current, kind);
+            _mediaGeneration[kind] = 0;
+        }
     }
 
     public async Task InitializeAsync(Action<CoreWebView2>? diagnosticConfigure = null)
@@ -83,10 +112,10 @@ public sealed class WebViewService : IDisposable
             _injection = new();
             StatusChanged?.Invoke("Loading Instagram...", false);
             Directory.CreateDirectory(AppPaths.UserData);
-            var options = new CoreWebView2EnvironmentOptions
-            {
-                AdditionalBrowserArguments = _settings.Current.HardwareAcceleration ? "" : "--disable-gpu"
-            };
+            string arguments = _settings.Current.HardwareAcceleration ? "" : "--disable-gpu";
+            if (_diagnosticInitialization && DiagnosticBrowserArguments is { } diagnosticArguments)
+                arguments = (arguments + " " + diagnosticArguments).Trim();
+            var options = new CoreWebView2EnvironmentOptions { AdditionalBrowserArguments = arguments };
             var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: AppPaths.UserData, options: options)
                 .WaitAsync(TimeSpan.FromSeconds(30));
             if (_disposed) return;
@@ -96,6 +125,9 @@ public sealed class WebViewService : IDisposable
             if (_disposed) return;
             diagnosticConfigure?.Invoke(View.CoreWebView2);
             await ConfigureCoreAsync(View.CoreWebView2);
+            // Before the first navigation: the page must never see a stale grant.
+            await SyncMediaPermissionsAsync(View.CoreWebView2, startup: true);
+            if (_disposed) return;
             _notifications.DirectInboxMonitoring = MonitorAllowed;
             if (_notifications.DirectInboxMonitoring) _directMonitorCheck.Start();
             await EnsureNotificationPermissionAsync(View.CoreWebView2);
@@ -146,6 +178,9 @@ public sealed class WebViewService : IDisposable
         core.NavigationCompleted += NavigationCompleted;
         core.NewWindowRequested += NewWindowRequested;
         core.PermissionRequested += PermissionRequested;
+        // A new document invalidates any permission question asked by the old one.
+        _documentEpochs[core] = 0;
+        core.ContentLoading += (_, _) => { if (_documentEpochs.ContainsKey(core)) _documentEpochs[core]++; };
         core.DownloadStarting += DownloadStarting;
         core.ContextMenuRequested += ContextMenuRequested;
         core.ProcessFailed += ProcessFailed;
@@ -298,8 +333,17 @@ public sealed class WebViewService : IDisposable
 
     private void NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
-        e.Handled = true;
         string uri = e.Uri;
+        // Fixed origin/path classes only, never the URL. Code 121 (www, "call"
+        // path, user gesture) is how Instagram opens its call page.
+        LoggingService.Write(LogEvent.NewWindowRequested,
+            code: MediaPermissionPolicy.OriginCategory(uri) * 100 + PathCategory(uri) * 10 + (e.IsUserInitiated ? 1 : 0));
+        if (!_disposed && sender is CoreWebView2 opener && IsCallPopup(uri))
+        {
+            OpenCallWindow(opener, e);
+            return;
+        }
+        e.Handled = true;
         _owner.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_disposed) return;
@@ -309,8 +353,132 @@ public sealed class WebViewService : IDisposable
         }));
     }
 
+    // Only a call page on the two exact media origins gets its own window;
+    // other Instagram pop-ups keep opening in the main view.
+    internal static bool IsCallPopup(string? uri) => MediaPermissionPolicy.IsMediaOrigin(uri) && PathCategory(uri) == 2;
+
+    // Real pop-up semantics (SDK NewWindow): same environment and profile as
+    // the opener, target not navigated before assignment, so window.opener,
+    // postMessage and window.close() behave as in a browser. The main window
+    // stays usable during the call.
+    private void OpenCallWindow(CoreWebView2 opener, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        CoreWebView2Deferral deferral;
+        try { deferral = e.GetDeferral(); }
+        catch (Exception error) when (error is COMException or InvalidOperationException)
+        {
+            LoggingService.Write(LogEvent.CallWindowFailed, error);
+            e.Handled = true;
+            return;
+        }
+        double width = 1000, height = 720;
+        try
+        {
+            var features = e.WindowFeatures;
+            if (features.HasSize) { width = features.Width; height = features.Height; }
+        }
+        catch (Exception error) when (error is COMException or InvalidOperationException or NotImplementedException) { }
+        var environment = opener.Environment;
+        _owner.Dispatcher.BeginInvoke(new Action(async () =>
+        {
+            CallWindow? window = null;
+            try
+            {
+                if (_disposed) throw new ObjectDisposedException(nameof(WebViewService));
+                window = new CallWindow(width, height, _owner);
+                window.Show();
+                await window.View.EnsureCoreWebView2Async(environment).WaitAsync(TimeSpan.FromSeconds(20));
+                if (_disposed) throw new ObjectDisposedException(nameof(WebViewService));
+                var core = window.View.CoreWebView2;
+                ConfigureCallCore(core, window);
+                DiagnosticCallConfigure?.Invoke(core);
+                e.NewWindow = core;
+                e.Handled = true;
+                _callWindows.Add(window);
+                LoggingService.Write(LogEvent.CallWindowOpened, code: _callWindows.Count);
+                SetBackground(_background);
+            }
+            catch (Exception error)
+            {
+                LoggingService.Write(LogEvent.CallWindowFailed, error);
+                try { e.Handled = true; }
+                catch (Exception) { }
+                if (window is not null) { _callWindows.Remove(window); window.Close(); }
+                if (!_disposed) UserNotice?.Invoke("The Instagram call window could not open.\nTry again, or restart InstaDesktop.");
+            }
+            finally
+            {
+                try { deferral.Complete(); }
+                catch (Exception error) when (error is COMException or InvalidOperationException) { LoggingService.Write(LogEvent.CallWindowFailed, error); }
+            }
+        }));
+    }
+
+    private void ConfigureCallCore(CoreWebView2 core, CallWindow window)
+    {
+        var s = core.Settings;
+        s.AreDevToolsEnabled = _settings.Current.DeveloperTools;
+        s.IsStatusBarEnabled = false;
+        s.IsZoomControlEnabled = false;
+        s.AreHostObjectsAllowed = false;
+        s.AreBrowserAcceleratorKeysEnabled = true;
+        s.AreDefaultContextMenusEnabled = true;
+        _documentEpochs[core] = 0;
+        core.ContentLoading += (_, _) => { if (_documentEpochs.ContainsKey(core)) _documentEpochs[core]++; };
+        // Same media rules, prompts and revocation as the main page.
+        core.PermissionRequested += PermissionRequested;
+        core.NewWindowRequested += NewWindowRequested;
+        core.DownloadStarting += DownloadStarting;
+        core.NotificationReceived += (_, e) => e.Handled = true; // the main page owns notifications
+        core.NavigationStarting += (_, e) =>
+        {
+            if (NavigationPolicy.IsTrusted(e.Uri)) return;
+            e.Cancel = true;
+            string target = e.Uri;
+            _owner.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (NavigationPolicy.UpgradeInstagramHttp(target) is { } https) { if (_documentEpochs.ContainsKey(core)) core.Navigate(https); }
+                else ShellService.OpenWeb(target);
+            }));
+        };
+        core.DocumentTitleChanged += (_, _) =>
+            window.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? "Instagram call" : core.DocumentTitle;
+        core.ContainsFullScreenElementChanged += (_, _) => window.SetFullscreen(core.ContainsFullScreenElement);
+        // The call page ending itself closes only its own window.
+        core.WindowCloseRequested += (_, _) =>
+        {
+            LoggingService.Write(LogEvent.WindowCloseRequested, code: 10 + PathCategory(core.Source));
+            _owner.Dispatcher.BeginInvoke(new Action(window.Close));
+        };
+        core.ProcessFailed += (_, e) =>
+        {
+            LoggingService.Write(LogEvent.WebViewProcessError, code: 2000 + (int)e.ProcessFailedKind);
+            if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
+                CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+            {
+                CancelPendingPermissions(core, null, MediaPermissionPolicy.Reason.Canceled);
+                _owner.Dispatcher.BeginInvoke(new Action(window.Close));
+            }
+        };
+        window.Closed += (_, _) =>
+        {
+            CancelPendingPermissions(core, null, MediaPermissionPolicy.Reason.Canceled);
+            _documentEpochs.Remove(core);
+            _callWindows.Remove(window);
+            try { window.View.Dispose(); }
+            catch (Exception error) { LoggingService.Write(LogEvent.CallWindowFailed, error); }
+            LoggingService.Write(LogEvent.CallWindowClosed, code: _callWindows.Count);
+            SetBackground(_background);
+        };
+    }
+
     private void PermissionRequested(object? sender, CoreWebView2PermissionRequestedEventArgs e)
     {
+        if (MediaPermissionPolicy.IsMediaKind(e.PermissionKind))
+        {
+            MediaPermissionRequested(sender as CoreWebView2, e);
+            return;
+        }
         if (!NavigationPolicy.IsTrusted(e.Uri))
         {
             e.State = CoreWebView2PermissionState.Deny;
@@ -325,37 +493,184 @@ public sealed class WebViewService : IDisposable
             LoggingService.Write(LogEvent.NotificationPermission, code: 10 + (int)e.State);
             return;
         }
-        if (e.PermissionKind == CoreWebView2PermissionKind.Microphone && !_settings.Current.AllowMicrophone)
-        { e.State = CoreWebView2PermissionState.Deny; return; }
-        if (e.PermissionKind == CoreWebView2PermissionKind.Camera && !_settings.Current.AllowCamera)
-        { e.State = CoreWebView2PermissionState.Deny; return; }
-        // Defer modal UI until after the WebView callback returns (COM reentrancy).
-        var deferral = e.GetDeferral();
-        _owner.Dispatcher.BeginInvoke(new Action(() =>
+        EnqueuePermission(sender as CoreWebView2, e);
+    }
+
+    private void MediaPermissionRequested(CoreWebView2? core, CoreWebView2PermissionRequestedEventArgs e)
+    {
+        var kind = e.PermissionKind;
+        var decision = MediaPermissionPolicy.ForPrimary(kind, e.Uri, !_disposed && MediaPermissionPolicy.Enabled(_settings.Current, kind));
+        if (decision.Prompt)
         {
-            try
+            EnqueuePermission(core, e);
+            return;
+        }
+        // Request-only: a saved app denial would suppress every later event,
+        // including after the user turns the switch on.
+        PendingPermission.Answer(e, CoreWebView2PermissionState.Deny, saves: false);
+        LoggingService.Write(LogEvent.MediaPermission, code: MediaPermissionPolicy.LogCode(1, kind, e.Uri, decision.Reason,
+            CoreWebView2PermissionState.Deny, false));
+        if (decision.Reason == MediaPermissionPolicy.Reason.SettingOff) NotifyMediaBlocked(kind);
+    }
+
+    private void NotifyMediaBlocked(CoreWebView2PermissionKind kind)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_lastBlockedNotice.TryGetValue(kind, out var last) && now - last < BlockedNoticeInterval) return;
+        _lastBlockedNotice[kind] = now;
+        LoggingService.Write(LogEvent.MediaPermissionBlockedNotice, code: (int)kind);
+        _owner.Dispatcher.BeginInvoke(new Action(() => { if (!_disposed) MediaBlocked?.Invoke(kind); }));
+    }
+
+    // One question per origin at a time. Every deferral taken here is completed
+    // exactly once: by the user's answer, or with a request-only Deny when the
+    // request became stale (setting off, new document, replaced or crashed
+    // WebView, shutdown) or anything failed. It never completes as Default,
+    // which would fall back to the WebView2 built-in permission UI.
+    private sealed class PendingPermission
+    {
+        public required CoreWebView2PermissionRequestedEventArgs Args { get; init; }
+        public required CoreWebView2Deferral Deferral { get; init; }
+        public required CoreWebView2 Core { get; init; }
+        public required CoreWebView2PermissionKind Kind { get; init; }
+        public required string Uri { get; init; }
+        public required string Origin { get; init; }
+        public required int Generation { get; init; }
+        public required int Epoch { get; init; }
+        public DateTime Created { get; } = DateTime.UtcNow;
+        public bool Completed { get; private set; }
+
+        public static void Answer(CoreWebView2PermissionRequestedEventArgs args, CoreWebView2PermissionState state, bool saves)
+        {
+            try { args.SavesInProfile = saves; }
+            catch (Exception error) when (error is NotImplementedException or COMException or InvalidOperationException) { }
+            try { args.State = state; }
+            catch (Exception error) when (error is COMException or InvalidOperationException)
+            { LoggingService.Write(LogEvent.MediaPermissionCompletionFailed, error); }
+        }
+
+        public void Complete(CoreWebView2PermissionState state, bool saves, MediaPermissionPolicy.Reason reason)
+        {
+            if (Completed) return;
+            Completed = true;
+            Answer(Args, state, saves);
+            try { Deferral.Complete(); }
+            catch (Exception error) when (error is COMException or InvalidOperationException or ObjectDisposedException)
+            { LoggingService.Write(LogEvent.MediaPermissionCompletionFailed, error); }
+            if (MediaPermissionPolicy.IsMediaKind(Kind))
+                LoggingService.Write(LogEvent.MediaPermission, code: MediaPermissionPolicy.LogCode(1, Kind, Uri, reason, state, saves));
+        }
+    }
+
+    private void EnqueuePermission(CoreWebView2? core, CoreWebView2PermissionRequestedEventArgs e)
+    {
+        CoreWebView2Deferral deferral;
+        try { deferral = e.GetDeferral(); }
+        catch (Exception error) when (error is COMException or InvalidOperationException)
+        {
+            LoggingService.Write(LogEvent.MediaPermissionCompletionFailed, error);
+            PendingPermission.Answer(e, CoreWebView2PermissionState.Deny, saves: false);
+            return;
+        }
+        string origin = Uri.TryCreate(e.Uri, UriKind.Absolute, out var parsed) ? parsed.GetLeftPart(UriPartial.Authority) : "";
+        var request = new PendingPermission
+        {
+            Args = e, Deferral = deferral, Core = core ?? Core!, Kind = e.PermissionKind, Uri = e.Uri, Origin = origin,
+            Generation = _mediaGeneration.GetValueOrDefault(e.PermissionKind),
+            Epoch = core is not null && _documentEpochs.TryGetValue(core, out int epoch) ? epoch : -1
+        };
+        if (_disposed || core is null || request.Epoch < 0 || _owner.Dispatcher.HasShutdownStarted)
+        {
+            request.Complete(CoreWebView2PermissionState.Deny, false, MediaPermissionPolicy.Reason.Stale);
+            return;
+        }
+        _pendingPermissions.Add(request);
+        if (MediaPermissionPolicy.IsMediaKind(request.Kind))
+            LoggingService.Write(LogEvent.MediaPermission, code: MediaPermissionPolicy.LogCode(1, request.Kind, request.Uri,
+                MediaPermissionPolicy.Reason.Prompt, CoreWebView2PermissionState.Default, false));
+        // Defer modal UI until after the WebView callback returns (COM reentrancy).
+        var operation = _owner.Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => _ = ProcessPermissionPromptsAsync()));
+        if (operation.Status == DispatcherOperationStatus.Aborted)
+            CancelPendingPermissions(null, null, MediaPermissionPolicy.Reason.Failed);
+    }
+
+    private bool IsCurrent(PendingPermission request) =>
+        !_disposed && _documentEpochs.TryGetValue(request.Core, out int epoch) && request.Epoch == epoch &&
+        !(request.Core == Core && NeedsRecovery) &&
+        (!MediaPermissionPolicy.IsMediaKind(request.Kind) ||
+         (MediaPermissionPolicy.IsMediaOrigin(request.Uri) && MediaPermissionPolicy.Enabled(_settings.Current, request.Kind) &&
+          _mediaGeneration.GetValueOrDefault(request.Kind) == request.Generation));
+
+    private void CancelPendingPermissions(CoreWebView2? core, CoreWebView2PermissionKind? kind, MediaPermissionPolicy.Reason reason)
+    {
+        foreach (var request in _pendingPermissions.ToArray())
+            if ((core is null || request.Core == core) && (kind is null || request.Kind == kind))
+                request.Complete(CoreWebView2PermissionState.Deny, false, reason);
+        _pendingPermissions.RemoveAll(p => p.Completed);
+    }
+
+    private async Task ProcessPermissionPromptsAsync()
+    {
+        if (_prompting) return;
+        _prompting = true;
+        try
+        {
+            while (_pendingPermissions.FirstOrDefault(p => !p.Completed) is { } first)
             {
-                if (_disposed) { e.State = CoreWebView2PermissionState.Deny; return; }
-                ShowRequested?.Invoke();
-                string name = e.PermissionKind switch
+                // getUserMedia({audio, video}) raises one event per device; let
+                // the second arrive so one question covers the whole request.
+                var wait = first.Created.AddMilliseconds(150) - DateTime.UtcNow;
+                if (wait > TimeSpan.Zero) await Task.Delay(wait);
+                bool Same(PendingPermission p) => !p.Completed && p.Core == first.Core && p.Origin == first.Origin;
+                foreach (var request in _pendingPermissions.Where(Same).ToArray())
+                    if (!IsCurrent(request)) request.Complete(CoreWebView2PermissionState.Deny, false, MediaPermissionPolicy.Reason.Stale);
+                var kinds = _pendingPermissions.Where(Same).Select(p => p.Kind).Distinct().ToList();
+                if (kinds.Count > 0)
                 {
-                    CoreWebView2PermissionKind.Microphone => "microphone",
-                    CoreWebView2PermissionKind.Camera => "camera",
-                    CoreWebView2PermissionKind.Notifications => "notifications",
-                    _ => e.PermissionKind.ToString()
-                };
-                bool allow = MessageBox.Show(_owner,
-                    $"Allow {new Uri(e.Uri).Host} to use {name}?\n\nYou can reset website permissions in Settings.",
-                    "Instagram permission", MessageBoxButton.YesNo, MessageBoxImage.Question,
-                    MessageBoxResult.No) == MessageBoxResult.Yes;
-                e.State = allow ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny;
-                try { e.SavesInProfile = true; }
-                catch (NotImplementedException) { }
-                catch (COMException) { }
+                    // Ask over the window that asked: a call window, or the main window.
+                    Window owner = _callWindows.FirstOrDefault(w => w.View.CoreWebView2 == first.Core) ?? _owner;
+                    if (owner == _owner) ShowRequested?.Invoke();
+                    else owner.Activate();
+                    LoggingService.Write(LogEvent.MediaPermissionPrompt, code: kinds.Sum(k => 1 << (int)k));
+                    bool allow = await AskPermissionAsync(kinds, first.Uri, owner);
+                    // Re-validate after the dialog: the switch, document or WebView
+                    // may have changed while it was open. Requests of the same
+                    // kinds that joined meanwhile share the answer.
+                    foreach (var request in _pendingPermissions.Where(p => Same(p) && kinds.Contains(p.Kind)).ToArray())
+                    {
+                        if (!IsCurrent(request)) request.Complete(CoreWebView2PermissionState.Deny, false, MediaPermissionPolicy.Reason.Stale);
+                        // Always saved: clearing a saved grant is what stops live capture.
+                        else request.Complete(allow ? CoreWebView2PermissionState.Allow : CoreWebView2PermissionState.Deny, true,
+                            allow ? MediaPermissionPolicy.Reason.UserAllowed : MediaPermissionPolicy.Reason.UserDenied);
+                    }
+                }
+                _pendingPermissions.RemoveAll(p => p.Completed);
             }
-            catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
-            finally { deferral.Complete(); }
+        }
+        catch (Exception error)
+        {
+            LoggingService.Write(LogEvent.UnexpectedException, error);
+            CancelPendingPermissions(null, null, MediaPermissionPolicy.Reason.Failed);
+        }
+        finally { _prompting = false; }
+    }
+
+    private async Task<bool> AskPermissionAsync(IReadOnlyList<CoreWebView2PermissionKind> kinds, string uri, Window owner)
+    {
+        string host = Uri.TryCreate(uri, UriKind.Absolute, out var parsed) ? parsed.Host : "Instagram";
+        if (DiagnosticPermissionPrompt is { } prompt) return await prompt(kinds, host);
+        string names = string.Join(" and ", kinds.Select(kind => kind switch
+        {
+            CoreWebView2PermissionKind.Microphone => "microphone",
+            CoreWebView2PermissionKind.Camera => "camera",
+            CoreWebView2PermissionKind.Notifications => "notifications",
+            _ => kind.ToString()
         }));
+        string detail = kinds.Any(MediaPermissionPolicy.IsMediaKind)
+            ? "\n\nInstaDesktop remembers your answer. To be asked again, turn the setting off and on in Settings, or use Reset website permissions."
+            : "\n\nYou can reset website permissions in Settings.";
+        return MessageBox.Show(owner, $"Allow {host} to use your {names}?{detail}",
+            "Instagram permission", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) == MessageBoxResult.Yes;
     }
 
     private void DownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
@@ -410,6 +725,7 @@ public sealed class WebViewService : IDisposable
         if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
             CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
         {
+            if (sender is CoreWebView2 failed) CancelPendingPermissions(failed, null, MediaPermissionPolicy.Reason.Canceled);
             // The page that owned these native notifications is gone.
             if (sender is not null) _notifications.ReleaseNative(sender);
             Fail("Instagram renderer crashed.");
@@ -495,7 +811,22 @@ public sealed class WebViewService : IDisposable
         catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
     }
 
-    private void WindowCloseRequested(object? sender, object e) => CloseRequested?.Invoke();
+    private void WindowCloseRequested(object? sender, object e)
+    {
+        // Evidence: a call page closing itself in the main view hides the app.
+        LoggingService.Write(LogEvent.WindowCloseRequested, code: PathCategory(Core?.Source));
+        CloseRequested?.Invoke();
+    }
+
+    // 0 other, 1 /direct/, 2 path mentions "call", 3 site root. Never the path itself.
+    internal static int PathCategory(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return 0;
+        string path = uri.AbsolutePath;
+        if (path.Contains("call", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (path.StartsWith("/direct/", StringComparison.Ordinal)) return 1;
+        return path == "/" ? 3 : 0;
+    }
 
     public void SetBackground(bool background)
     {
@@ -503,7 +834,8 @@ public sealed class WebViewService : IDisposable
         if (NeedsRecovery || !_memoryApiAvailable || Core is not { } core) return;
         // Low target may discard renderer resources. Keep normal memory while
         // notifications are enabled; never suspend the WebView for tray mode.
-        var target = background && _settings.Current.BackgroundLowMemory && !_settings.Current.AppNotifications
+        // A call window shares the opener's renderer; keep it at Normal during calls.
+        var target = background && _settings.Current.BackgroundLowMemory && !_settings.Current.AppNotifications && _callWindows.Count == 0
             ? CoreWebView2MemoryUsageTargetLevel.Low : CoreWebView2MemoryUsageTargetLevel.Normal;
         if (_memoryTarget == target) return;
         try
@@ -563,10 +895,12 @@ public sealed class WebViewService : IDisposable
 
     public async Task ApplySettingsAsync(bool customizationChanged)
     {
+        UpdateMediaSwitches();
         _notifications.DirectInboxMonitoring = MonitorAllowed;
         if (!_notifications.DirectInboxMonitoring) { _directMonitorCheck.Stop(); StopDirectMonitor(); }
         else _directMonitorCheck.Start();
         if (Core is not { } core) return;
+        await SyncMediaPermissionsAsync(core, startup: false);
         core.Settings.AreDevToolsEnabled = _settings.Current.DeveloperTools;
         if (!_settings.Current.AppNotifications) _notifications.Reset(removeNotifications: true);
         await EnsureNotificationPermissionAsync(core);
@@ -582,18 +916,98 @@ public sealed class WebViewService : IDisposable
         }
     }
 
-    public async Task ResetPermissionsAsync()
+    public async Task<PermissionResetResult> ResetPermissionsAsync()
     {
-        if (Core is not { } core) return;
-        var permissions = await core.Profile.GetNonDefaultPermissionSettingsAsync();
-        foreach (var permission in permissions)
-            if (NavigationPolicy.IsTrusted(permission.PermissionOrigin))
-                await core.Profile.SetPermissionStateAsync(permission.PermissionKind, permission.PermissionOrigin,
-                    CoreWebView2PermissionState.Default);
+        if (_disposed || NeedsRecovery || Core is not { } core) return PermissionResetResult.NotReady;
+        await _mediaSync.WaitAsync();
+        try
+        {
+            // An open question must not re-save a decision right after the reset.
+            CancelPendingPermissions(null, null, MediaPermissionPolicy.Reason.Canceled);
+            var permissions = await core.Profile.GetNonDefaultPermissionSettingsAsync();
+            int count = 0;
+            foreach (var permission in permissions)
+                if (NavigationPolicy.IsTrusted(permission.PermissionOrigin))
+                {
+                    await core.Profile.SetPermissionStateAsync(permission.PermissionKind, permission.PermissionOrigin,
+                        CoreWebView2PermissionState.Default);
+                    count++;
+                }
+            LoggingService.Write(LogEvent.MediaPermissionReset, code: Math.Min(count, 999));
+        }
+        catch (Exception error)
+        {
+            LoggingService.Write(LogEvent.MediaPermissionReset, error);
+            return error is NotImplementedException or NotSupportedException ||
+                (error is COMException com && com.HResult == unchecked((int)0x80004002))
+                ? PermissionResetResult.Unsupported : PermissionResetResult.Failed;
+        }
+        finally { _mediaSync.Release(); }
         // Notification permission follows the desktop setting. Leaving it at
         // Default here makes Notification.permission stop being granted until
         // Instagram happens to ask again (or the app is restarted).
         await EnsureNotificationPermissionAsync(core);
+        // Media stays at Default: asked again while on, denied per request while off.
+        await SyncMediaPermissionsAsync(core, startup: false);
+        return PermissionResetResult.Reset;
+    }
+
+    // Detects switch transitions made through Settings. Synchronous, so a pending
+    // question can never be answered against an outdated switch value.
+    private void UpdateMediaSwitches()
+    {
+        foreach (var kind in MediaPermissionPolicy.Kinds)
+        {
+            bool enabled = MediaPermissionPolicy.Enabled(_settings.Current, kind);
+            if (_appliedMedia[kind] == enabled) continue;
+            _appliedMedia[kind] = enabled;
+            _mediaGeneration[kind]++;
+            LoggingService.Write(LogEvent.MediaPermissionSync, code: (int)kind * 10 + (enabled ? 1 : 0));
+            if (enabled) _clearDeniedMedia.Add(kind); // explicit re-enable: ask again
+            else
+            {
+                _clearDeniedMedia.Remove(kind);
+                CancelPendingPermissions(null, kind, MediaPermissionPolicy.Reason.Stale);
+            }
+        }
+    }
+
+    private async Task SyncMediaPermissionsAsync(CoreWebView2 core, bool startup)
+    {
+        await _mediaSync.WaitAsync();
+        try
+        {
+            // Builds up to 1.1.0 saved the app's own "switch off" denial, which no
+            // later event could undo, and it cannot be told apart from a user's
+            // No. Recover conservatively, once: clear a saved Deny so Instagram
+            // asks again. This migration never grants anything.
+            bool migrate = startup && _settings.Current.MediaPermissionRevision < 1;
+            foreach (var kind in MediaPermissionPolicy.Kinds)
+            {
+                if (startup) _appliedMedia[kind] = MediaPermissionPolicy.Enabled(_settings.Current, kind);
+                bool clear = migrate || _clearDeniedMedia.Contains(kind);
+                await MediaPermissionPolicy.SyncAsync(core.Profile, kind,
+                    () => !_disposed && MediaPermissionPolicy.Enabled(_settings.Current, kind), () => clear);
+                if (clear) _clearDeniedMedia.Remove(kind);
+            }
+            if (migrate && !_disposed)
+            {
+                var next = _settings.Current.Copy();
+                next.MediaPermissionRevision = 1;
+                await _settings.SaveAsync(next);
+                LoggingService.Write(LogEvent.MediaPermissionMigrated, code: 1);
+            }
+        }
+        catch (Exception error) { LoggingService.Write(LogEvent.MediaPermissionSync, error); }
+        finally { _mediaSync.Release(); }
+    }
+
+    // Combined Instagram site state for Settings; null when the profile is unavailable.
+    internal async Task<CoreWebView2PermissionState?> GetMediaSiteStateAsync(CoreWebView2PermissionKind kind)
+    {
+        if (_disposed || NeedsRecovery || Core is not { } core) return null;
+        try { return await MediaPermissionPolicy.SiteStateAsync(core.Profile, kind); }
+        catch (Exception error) { LoggingService.Write(LogEvent.MediaPermissionSync, error); return null; }
     }
 
     private void Fail(string message)
@@ -612,6 +1026,13 @@ public sealed class WebViewService : IDisposable
         StopDirectMonitor();
         _notifications.Reset(removeNotifications: false);
         _notificationScriptId = null;
+        // Complete deferrals while their WebView is still alive. Call windows
+        // are independent views and keep running across a main-page rebuild.
+        if (View?.CoreWebView2 is { } primary)
+        {
+            CancelPendingPermissions(primary, null, MediaPermissionPolicy.Reason.Canceled);
+            _documentEpochs.Remove(primary);
+        }
         if (View is null) return;
         View.Dispose();
         _host.Children.Remove(View);
@@ -660,6 +1081,7 @@ public sealed class WebViewService : IDisposable
     public void Dispose()
     {
         _disposed = true;
+        foreach (var window in _callWindows.ToArray()) window.Close();
         DisposeView();
     }
 

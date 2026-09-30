@@ -20,6 +20,8 @@ public partial class App : Application
     internal bool DiagnosticMode { get; private set; }
     internal bool WindowLayoutTest { get; private set; }
     internal bool NotificationTest { get; private set; }
+    internal bool MediaPermissionTest { get; private set; }
+    internal bool SettingsSnapshot { get; private set; }
     // Real signed-in profile, redacted report only; see InboxDiagnosticsRunner.
     internal bool InboxDiagnostics { get; private set; }
     internal int InboxDiagnosticSeconds { get; private set; } = 180;
@@ -50,6 +52,16 @@ public partial class App : Application
             {
                 diagnosticIndex = Array.IndexOf(e.Args, "--notification-test");
                 NotificationTest = DiagnosticMode = diagnosticIndex >= 0;
+            }
+            if (!DiagnosticMode)
+            {
+                diagnosticIndex = Array.IndexOf(e.Args, "--media-permission-test");
+                MediaPermissionTest = DiagnosticMode = diagnosticIndex >= 0;
+            }
+            if (!DiagnosticMode)
+            {
+                diagnosticIndex = Array.IndexOf(e.Args, "--settings-snapshot");
+                SettingsSnapshot = DiagnosticMode = diagnosticIndex >= 0;
             }
             if (!DiagnosticMode)
             {

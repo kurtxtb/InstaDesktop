@@ -62,6 +62,7 @@ public partial class MainWindow : Window
         _web.HistoryChanged += (back, forward) => { BackButton.IsEnabled = back; ForwardButton.IsEnabled = forward; };
         _web.FullscreenChanged += SetMediaFullscreen;
         _web.UserNotice += ShowNotice;
+        _web.MediaBlocked += ShowMediaBlocked;
         SetSelectedSection(NavigationSection.Home);
         _web.StatusChanged += (message, recoverable) =>
         {
@@ -75,8 +76,12 @@ public partial class MainWindow : Window
         _web.Ready += () => StatusPanel.Visibility = Visibility.Collapsed;
         _web.ShowRequested += ShowFromTray;
         _web.CloseRequested += Close;
-        _web.InjectionFailed += () => _tray?.ShowBalloonTip(5000, "UI customization could not load",
-            "Instagram is still available. Check your CSS / JavaScript files and app log.", Forms.ToolTipIcon.Warning);
+        _web.InjectionFailed += () =>
+        {
+            _balloonOpensSettings = false;
+            _tray?.ShowBalloonTip(5000, "UI customization could not load",
+                "Instagram is still available. Check your CSS / JavaScript files and app log.", Forms.ToolTipIcon.Warning);
+        };
         SourceInitialized += (_, _) =>
         {
             HwndSource.FromHwnd(new WindowInteropHelper(this).Handle).AddHook(WindowMessages);
@@ -96,6 +101,10 @@ public partial class MainWindow : Window
                     ((App)Application.Current).InboxDiagnosticSeconds);
             else if (((App)Application.Current).NotificationTest)
                 await Diagnostics.NotificationTestRunner.RunAsync(this, _settings, ((App)Application.Current).DiagnosticOutput!);
+            else if (((App)Application.Current).SettingsSnapshot)
+                await Diagnostics.SettingsSnapshot.RunAsync(this, _settings, ((App)Application.Current).DiagnosticOutput!);
+            else if (((App)Application.Current).MediaPermissionTest)
+                await Diagnostics.MediaPermissionTests.RunAsync(this, _settings, ((App)Application.Current).DiagnosticOutput!);
             else if (((App)Application.Current).WindowLayoutTest)
                 await Diagnostics.WindowLayoutTestRunner.RunAsync(this, ((App)Application.Current).DiagnosticOutput!);
             else
@@ -121,6 +130,8 @@ public partial class MainWindow : Window
         _trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? (Icon)SystemIcons.Application.Clone();
         _tray = new Forms.NotifyIcon { Icon = _trayIcon, Text = "InstaDesktop", Visible = true, ContextMenuStrip = menu };
         _tray.DoubleClick += (_, _) => ShowFromTray();
+        _tray.BalloonTipClicked += (_, _) => { if (_balloonOpensSettings) ShowSettings(); };
+        _tray.BalloonTipClosed += (_, _) => _balloonOpensSettings = false;
     }
 
     public void ShowFromTray()
@@ -141,6 +152,7 @@ public partial class MainWindow : Window
         if (showHint && !_trayHintShown)
         {
             _trayHintShown = true;
+            _balloonOpensSettings = false;
             _tray?.ShowBalloonTip(3000, "InstaDesktop is running in the tray",
                 "Right-click the tray icon for Settings or Exit.", Forms.ToolTipIcon.Info);
         }
@@ -410,9 +422,25 @@ public partial class MainWindow : Window
     {
         // Notifications use the native tray surface; navigation notices stay silent.
         if (message.Contains('\n'))
+        {
+            _balloonOpensSettings = false;
             _tray?.ShowBalloonTip(5000, "Instagram", message.Replace('\n', ' '), Forms.ToolTipIcon.Info);
+        }
         NoticePanel.Visibility = Visibility.Collapsed;
     }
+    private bool _balloonOpensSettings;
+
+    // Low-key and actionable: one tray notice (throttled by WebViewService),
+    // clicking it opens Settings. No modal dialog interrupts the call screen.
+    private void ShowMediaBlocked(Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind kind)
+    {
+        if (_tray is null) return;
+        string device = kind == Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind.Camera ? "camera" : "microphone";
+        _balloonOpensSettings = true;
+        _tray.ShowBalloonTip(8000, "Instagram call blocked",
+            "Instagram asked to use your " + device + ", but it is turned off in InstaDesktop. Click to open Settings.", Forms.ToolTipIcon.Info);
+    }
+
     private void DismissNotice_Click(object sender, RoutedEventArgs e) => NoticePanel.Visibility = Visibility.Collapsed;
     private void Settings_Click(object sender, RoutedEventArgs e) => ShowSettings();
     private void Minimize_Click(object sender, RoutedEventArgs e) => SystemCommands.MinimizeWindow(this);

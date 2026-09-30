@@ -16,6 +16,8 @@ public sealed class AppSettings
     public bool AppNotifications { get; set; } = true;
     public bool AllowMicrophone { get; set; }
     public bool AllowCamera { get; set; }
+    // 1 = the one-time recovery of media denials saved by builds <= 1.1.0 ran.
+    public int MediaPermissionRevision { get; set; }
     public SidebarMode SidebarMode { get; set; } = SidebarMode.Expanded;
     public bool CompactInstagramLayout { get; set; }
     public double Width { get; set; } = 1200;

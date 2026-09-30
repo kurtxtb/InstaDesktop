@@ -1,5 +1,22 @@
 # InstaDesktop 驗證紀錄
 
+## 獨立通話視窗與設定頁重新設計（2026-10-01，最新）
+
+- 實機紀錄 `NewWindowRequested Code=121` 證實 Instagram 以 www 網域、路徑含 call 的 popup 開啟通話；舊版把它導到主視窗。現在改為 SDK `NewWindow` 的獨立 `CallWindow`（同一 Environment/Profile，保留 `window.opener`）。
+- 媒體測試擴充為 103 項（Stable publish 通過）：通話視窗開啟、主畫面不變、opener 雙向、共用權限流程、關閉開關停止通話視窗擷取（關閉鏡頭會結束同一次請求的所有 track，麥克風授權保留）、`window.close()` 只關通話視窗、等待詢問時關閉視窗、非通話與不可信 popup 維持原行為、服務釋放時關閉通話視窗；通話視窗全程使用離線 fixture。
+- 通知 270/270、window layout 通過。設定頁以 `--settings-snapshot` 渲染檢查：`artifacts/verification/settings-redesign.png`。
+- 仍未執行真實 Instagram 通話。
+
+## 通話麥克風與鏡頭權限修正（2026-09-30）
+
+- 環境：Windows 10 Pro 19045，.NET SDK 8.0.319（使用者目錄），WebView2 Runtime 154.0.4258.37，SDK 1.0.4191.47。
+- `--media-permission-test <report.json>`（`scripts/verify-media-permissions.ps1`）：隔離 profile、離線 fixture、Chromium 虛擬擷取裝置（`--use-fake-device-for-media-stream`，僅限診斷 Environment，未使用 fake-UI）。報告含 Runtime 事實探測（`facts`）與 87 項 App 檢查。
+- Runtime 事實：handler 回 Deny 且保存時，之後的請求不再觸發事件（舊版根因）；已保存 Allow 改為 Default/Deny 會結束進行中的 track，只允許單次請求、沒有保存的 Allow 不會；共用 profile 的隱藏 controller 在 profile 已保存 Allow 時不觸發事件即可擷取；委派給跨來源 iframe 的請求歸屬於頂層 origin；Low memory 不會結束 track。
+- Stable publish：媒體 87/87、通知 270/270、window layout 通過；Single-file 媒體 87/87。連續三次開發建置媒體測試皆通過。
+- 既有 smoke 測試在「CSS and JavaScript injection」失敗；以 HEAD `cbc81fa` 另行建置在相同 Runtime 下也在同一項失敗（`artifacts/verification/media-fix-head-baseline-smoke.json`），與本次修改無關。
+- 報告：`artifacts/verification/media-permissions.json`、`media-permissions-single-file.json`、`media-fix-notifications.json`、`media-fix-window-layout.json`、`media-fix-smoke.json`。
+- 未執行真實 Instagram 通話、真實裝置、Windows 隱私開關或 popup 通話流程；發行說明中的已知問題保留，直到手動驗收完成。
+
 ## 設定按鈕點擊修正（最新）
 
 - 標題列設定按鈕加上 `WindowChrome.IsHitTestVisibleInChrome=True`，讓滑鼠事件交給按鈕，而不是視窗拖曳區。

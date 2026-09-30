@@ -76,6 +76,10 @@ internal sealed class DirectInboxMonitor : IDisposable
             Attach(core);
             try { core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal; }
             catch (Exception error) { LoggingService.Write(LogEvent.DirectMonitorInitializationFailed, error); }
+            // Fail closed: without the capture block the monitor does not start.
+            try { await core.AddScriptToExecuteOnDocumentCreatedAsync(MediaPermissionPolicy.MonitorCaptureBlockScript); }
+            catch (Exception error) { LoggingService.Write(LogEvent.MonitorCaptureBlockFailed, error); throw; }
+            if (_disposed) return;
             diagnosticConfigure?.Invoke(core);
             string script = await WebViewService.ReadNotificationAssetAsync("direct-inbox-dom.js") + "\n" +
                 await WebViewService.ReadNotificationAssetAsync("direct-inbox-monitor.js");
@@ -145,6 +149,8 @@ internal sealed class DirectInboxMonitor : IDisposable
     // Instagram may ask for notification permission from this background page.
     // It must follow the AppNotifications setting without any dialog; all other
     // permissions (camera, microphone, ...) and other origins stay denied.
+    // A grant already saved for the primary page never raises this event here,
+    // so capture is additionally removed by MonitorCaptureBlockScript.
     private void PermissionRequested(object? sender, CoreWebView2PermissionRequestedEventArgs e)
     {
         var decision = NotificationPermissionPolicy.ForMonitor(e.PermissionKind, e.Uri, !_disposed && _notificationsEnabled());
@@ -152,6 +158,9 @@ internal sealed class DirectInboxMonitor : IDisposable
         try { e.SavesInProfile = decision.SavesInProfile; }
         catch (Exception error) when (error is NotImplementedException or System.Runtime.InteropServices.COMException) { }
         LoggingService.Write(LogEvent.DirectMonitorPermission, code: (int)e.PermissionKind * 10 + (int)decision.State);
+        if (MediaPermissionPolicy.IsMediaKind(e.PermissionKind))
+            LoggingService.Write(LogEvent.MediaPermission, code: MediaPermissionPolicy.LogCode(2, e.PermissionKind, e.Uri,
+                MediaPermissionPolicy.ForMonitor(e.PermissionKind, e.Uri).Reason, decision.State, decision.SavesInProfile));
     }
 
     private void NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e) => e.Handled = true;
