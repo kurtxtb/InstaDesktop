@@ -70,3 +70,5 @@ build-installer.bat        Create the Windows installer
 ## 📄 License
 
 MIT License. See [LICENSE](LICENSE) when included in a distribution.
+
+Emoji are rendered with a font built from [Twemoji](https://github.com/jdecked/twemoji) v17.0.3 graphics. Copyright 2019 Twitter, Inc and other contributors; graphics licensed under CC-BY 4.0 ([Assets/Fonts/Twemoji-LICENSE-GRAPHICS.txt](Assets/Fonts/Twemoji-LICENSE-GRAPHICS.txt)).

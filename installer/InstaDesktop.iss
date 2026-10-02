@@ -40,6 +40,13 @@ Source: "..\publish\win-x64\*"; DestDir: "{app}"; Excludes: "Assets\*"; Flags: i
 ; Preserve user edits during an upgrade.
 Source: "..\publish\win-x64\Assets\*"; DestDir: "{app}\Assets"; Flags: onlyifdoesntexist recursesubdirs createallsubdirs
 
+[InstallDelete]
+; Emoji fonts from pre-release test builds, superseded by Twemoji.woff2.
+Type: files; Name: "{app}\Assets\Fonts\NotoColorEmoji.woff2"
+Type: files; Name: "{app}\Assets\Fonts\NotoColorEmoji-OFL.txt"
+Type: files; Name: "{app}\Assets\Fonts\Noto-3D-Emoji.ttf"
+Type: files; Name: "{app}\Assets\Fonts\Noto-3D-Emoji-OFL.txt"
+
 [Icons]
 Name: "{group}\InstaDesktop"; Filename: "{app}\InstaDesktop.exe"
 Name: "{autodesktop}\InstaDesktop"; Filename: "{app}\InstaDesktop.exe"; Tasks: desktopicon

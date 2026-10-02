@@ -59,6 +59,11 @@ internal static class SmokeTestRunner
                 !core.Settings.IsZoomControlEnabled, "browser controls disabled", checks);
             Check(await core.ExecuteScriptAsync("Boolean(document.querySelector('body') && document.body.childElementCount > 0)") == "true",
                 "Instagram document rendered", checks);
+            // An Emoji 13 character Windows 10's Segoe UI Emoji cannot draw.
+            await core.ExecuteScriptAsync("document.fonts.load('16px \"-apple-system\"', '\\u{1F972}')" +
+                ".then(f => window.__instaDesktopEmojiCheck = f.length > 0 && f.every(x => x.status === 'loaded'))");
+            for (int i = 0; i < 50 && await core.ExecuteScriptAsync("window.__instaDesktopEmojiCheck") == "null"; i++) await Task.Delay(100);
+            Check(await core.ExecuteScriptAsync("window.__instaDesktopEmojiCheck") == "true", "bundled Emoji font loaded", checks);
             Check(await core.ExecuteScriptAsync("Boolean(window.__InstaDesktopCustomization?.version === 1 && document.getElementById('instadesktop-custom-style'))") == "true",
                 "CSS and JavaScript injection", checks);
 

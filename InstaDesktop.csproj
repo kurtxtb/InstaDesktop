@@ -28,6 +28,6 @@
     <!-- WPF Content pack URIs require Assembly.Location, which is empty in a
          single-file bundle. Embed the window/image icon as a WPF resource. -->
     <Resource Include="Assets\Icons\app.ico" />
-    <EmbeddedResource Include="Assets\Scripts\**\*.js;Assets\Styles\*.css" />
+    <EmbeddedResource Include="Assets\Scripts\**\*.js;Assets\Styles\*.css;Assets\Fonts\*.woff2" />
   </ItemGroup>
 </Project>

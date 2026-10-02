@@ -193,6 +193,8 @@ public sealed class WebViewService : IDisposable
         catch (Exception e) when (e is NotImplementedException or COMException) { }
         try { core.NotificationReceived += NotificationReceived; }
         catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
+        try { await EmojiFontService.ConfigureAsync(core); }
+        catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
         await ConfigureNotificationsAsync(core);
     }
 
