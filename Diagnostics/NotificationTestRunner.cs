@@ -110,6 +110,50 @@ internal static class NotificationTestRunner
                 coordinator.Receive(dom); enabled = false;
                 await Task.Delay(1400);
                 Check(presenter.Shows.Count == 0, "disable cancels pending delivery");
+                enabled = true; coordinator.Reset(false); presenter.Shows.Clear();
+                coordinator.SoundEnabled = () => false;
+                coordinator.Receive(native);
+                await Task.Delay(500);
+                Check(presenter.Shows.Count == 1 && presenter.Shows[0].Value.Silent, "notification sound off shows the toast silently");
+                coordinator.SoundEnabled = () => true;
+                coordinator.Reset(false); presenter.Shows.Clear();
+
+                // Hide message content: sender only, no text, no image.
+                int presented = 0;
+                coordinator.Presented += () => presented++;
+                coordinator.HideContent = () => true;
+                coordinator.Receive(native with { Type = InstagramNotificationType.DirectMessage, ImageUrl = "https://scontent.cdninstagram.com/x.jpg" });
+                await Task.Delay(500);
+                Check(presenter.Shows.Count == 1 && presenter.Shows[0].Value.Body == "Sent you a message" &&
+                    presenter.Shows[0].Value.ImageUrl is null && presenter.Shows[0].Value.Title == native.Title,
+                    "hidden content keeps the sender and drops text and image");
+                Check(presented == 1, "a new toast is announced once (taskbar flash)");
+                coordinator.HideContent = () => false;
+                coordinator.Reset(false); presenter.Shows.Clear();
+
+                // A muted conversation shows nothing; others still do.
+                string? mutedThread = dom.ThreadUrl;
+                coordinator.IsMuted = thread => thread == mutedThread;
+                coordinator.Receive(dom);
+                await Task.Delay(1500);
+                Check(presenter.Shows.Count == 0, "a muted conversation shows no toast");
+                coordinator.IsMuted = _ => false;
+                coordinator.Reset(false); presenter.Shows.Clear();
+
+                // The toast's Mute button: mutes the thread without opening the window.
+                string? muteRequested = null;
+                coordinator.MuteRequested += thread => muteRequested = thread;
+                coordinator.Receive(native);
+                await Task.Delay(500);
+                activated = null;
+                var mute = new Microsoft.Toolkit.Uwp.Notifications.ToastArguments();
+                mute.Add("action", "mute");
+                mute.Add("notification", presenter.Shows[0].Token);
+                mute.Add("thread", "https://www.instagram.com/direct/t/987/");
+                coordinator.Activate(mute.ToString());
+                Check(muteRequested == (presenter.Shows[0].Value.ThreadUrl ?? "https://www.instagram.com/direct/t/987/") && activated is null,
+                    "Mute mutes the conversation and does not open the window");
+                coordinator.Reset(false); presenter.Shows.Clear(); enabled = false;
                 coordinator.Receive(native);
                 Check(presenter.Shows.Count == 0, "disabled mode ignores native candidates");
                 enabled = true; presenter.Available = false;
@@ -234,13 +278,13 @@ internal static class NotificationTestRunner
                 finally { web.NotificationReceived -= NativeReceived; }
             }
             settings.Current.AppNotifications = true;
-            await window.Web.ApplySettingsAsync(false);
+            await window.Web.ApplySettingsAsync();
             await window.Web.ResetPermissionsAsync();
             Check(await web.ExecuteScriptAsync("Notification.permission") == "\"granted\"", "resetting permissions preserves enabled desktop notifications");
             window.Web.SetBackground(true);
             Check(!web.IsSuspended && (!window.Web.MemoryApiAvailable || web.MemoryUsageTargetLevel == CoreWebView2MemoryUsageTargetLevel.Normal), "notifications enabled background stays normal and unsuspended");
             settings.Current.AppNotifications = false;
-            await window.Web.ApplySettingsAsync(false);
+            await window.Web.ApplySettingsAsync();
             await window.Web.ResetPermissionsAsync();
             Check(await web.ExecuteScriptAsync("Notification.permission") == "\"denied\"", "resetting permissions preserves disabled desktop notifications");
             window.Web.SetBackground(true);

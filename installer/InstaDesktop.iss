@@ -36,16 +36,12 @@ UninstallDisplayName={#AppName}
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "..\publish\win-x64\*"; DestDir: "{app}"; Excludes: "Assets\*"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Preserve user edits during an upgrade.
-Source: "..\publish\win-x64\Assets\*"; DestDir: "{app}\Assets"; Flags: onlyifdoesntexist recursesubdirs createallsubdirs
+Source: "..\publish\win-x64\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
-; Emoji fonts from pre-release test builds, superseded by Twemoji.woff2.
-Type: files; Name: "{app}\Assets\Fonts\NotoColorEmoji.woff2"
-Type: files; Name: "{app}\Assets\Fonts\NotoColorEmoji-OFL.txt"
-Type: files; Name: "{app}\Assets\Fonts\Noto-3D-Emoji.ttf"
-Type: files; Name: "{app}\Assets\Fonts\Noto-3D-Emoji-OFL.txt"
+; Builds up to 1.2.1 copied editable scripts, styles and fonts into Assets and
+; kept them across upgrades. They are now built into the app and never read.
+Type: filesandordirs; Name: "{app}\Assets"
 
 [Icons]
 Name: "{group}\InstaDesktop"; Filename: "{app}\InstaDesktop.exe"
@@ -54,7 +50,8 @@ Name: "{autodesktop}\InstaDesktop"; Filename: "{app}\InstaDesktop.exe"; Tasks: d
 [Run]
 Filename: "{app}\InstaDesktop.exe"; Description: "Launch InstaDesktop"; Flags: nowait postinstall skipifsilent
 ; The in-app updater runs this installer with /SILENT /RELAUNCH=1: start the new version again.
-Filename: "{app}\InstaDesktop.exe"; Flags: nowait skipifnotsilent; Check: ShouldRelaunch
+; /BACKGROUND=1: the app was in the tray, so it returns to the tray.
+Filename: "{app}\InstaDesktop.exe"; Parameters: "{code:RelaunchParameters}"; Flags: nowait skipifnotsilent; Check: ShouldRelaunch
 
 [UninstallRun]
 Filename: "{app}\InstaDesktop.exe"; Parameters: "--uninstall-notifications"; Flags: runhidden waituntilterminated
@@ -63,6 +60,14 @@ Filename: "{app}\InstaDesktop.exe"; Parameters: "--uninstall-notifications"; Fla
 function ShouldRelaunch: Boolean;
 begin
   Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
+function RelaunchParameters(Param: String): String;
+begin
+  if ExpandConstant('{param:BACKGROUND|0}') = '1' then
+    Result := '--background'
+  else
+    Result := '';
 end;
 
 function InitializeSetup: Boolean;

@@ -1,6 +1,30 @@
 # InstaDesktop 驗證紀錄
 
-## 獨立通話視窗與設定頁重新設計（2026-10-01，最新）
+## 訊息視窗、淺色／深色、繁體中文、單一對話靜音、隱藏內容、工作列閃爍與跳躍清單、清除快取（2026-10-06，v1.3.0，最新）
+
+- Stable publish：smoke 全數通過，新增檢查：淺色／深色切換套用到 App 筆刷、Instagram 配色與 WebView 背景；Windows 語言判斷（zh-TW/HK/MO 才用繁中）與程式碼、XAML 的繁中文字；訊息視窗開啟、重複開啟沿用同一視窗、關閉記住大小；清除快取後重新載入且 localStorage 保留；跳躍清單 7 個項目、只接受固定指令、第二次啟動透過 named pipe 傳指令、Reels 指令實際導覽；工作列閃爍依設定與焦點；靜音只存有效對話並在重新啟動後保留；所有介面字串都有中英文。
+- 通知 281/281（新增：對話 toast 有背景啟動的「靜音」按鈕、無對話的 toast 沒有；隱藏內容保留寄件者、去掉內文與圖片；新 toast 只宣告一次；靜音對話不顯示；按「靜音」只靜音不開視窗）；媒體 103/103；window layout 通過。
+- 設定頁快照（繁中）：`artifacts/verification/settings-zh-light.png`、`settings-zh-dark.png`。
+- 未實測：真實 toast 上按「靜音」（需要真實訊息通知）、實際工作列閃爍與跳躍清單的外觀（需要可見的桌面工作階段）、Windows 切換淺色／深色時的即時跟隨（以 `UserPreferenceChanged` 實作，未切換系統設定）。
+
+## 未讀徽章、暫停通知、直接下載、通話置頂與更新選項（2026-10-06）
+
+- Stable publish：smoke 全數通過，新增檢查：合成的「訊息」連結數字 → 工作列 overlay、視窗標題、系統匣圖示；關閉徽章設定；數字歸零清除；暫停／恢復通知與「明天早上 8:00」；下載資料夾套用到 profile 且 blob 下載不詢問直接存檔；通話視窗依設定置頂、標題列選單切換。
+- 通知 275/275（新增：提示音關閉時 toast 為靜音；更新後通知只在升級時出現、連到正確的 release 頁）；媒體 103/103（一次中途 InvalidOperationException 未重現，之後連續 3 次通過）；window layout 通過。
+- 設定頁以 `--settings-snapshot` 渲染完整頁面（快照改為輸出整個捲動內容）：`artifacts/verification/settings-features.png`；徽章圖：`stable-smoke.taskbar-badge.png`、`stable-smoke.tray-badge.png`。
+- 未實測：真實 Instagram 帳號的未讀數（以合成 DOM 驗證，讀取方式與既有通知徽章相同）；關閉自動更新時的「有新版本」通知與從通知安裝（需要比目前更新的 GitHub Release）。
+
+## 自動復原、更新、縮放與移除未使用的客製化層（2026-10-05）
+
+- 環境：Windows 10 Pro 19045，.NET SDK 8.0.319（使用者目錄），WebView2 Runtime 154.0.4258.53，SDK 1.0.4191.47。
+- Stable publish：smoke 全數通過（舊版長期失敗的「CSS and JavaScript injection」已隨客製化層移除，測試改為檢查實際出貨行為）、通知 270/270、媒體 103/103、window layout 通過；安裝程式可編譯。
+- 新 smoke 檢查：設定部分更新不互相覆蓋、縮放值限制範圍、Ctrl+1~4 目標真的導覽頁面、快速上一頁/下一頁不被當成載入失敗、縮放放大/縮小/重設與儲存、全螢幕隱藏/恢復標題列、瀏覽器程序被終止後不按 Retry 自動恢復。
+- 過程中發現並修正兩個既有問題：(1) 瀏覽器程序崩潰後讀取 `WebView2.CoreWebView2` 會丟例外，使重建（含 Retry 按鈕）永遠失敗；(2) 被較新導覽取代或由頁面中止的導覽（ConnectionAborted）被當成載入失敗而顯示錯誤畫面。
+- 第二輪（版本 1.2.2）：smoke 另加「離線載入失敗後，網路恢復 3 秒即重試並載入」、「忙碌 3 秒的頁面在寬限期內不被替換、仍無回應才替換」、「深色 viewport 樣式於文件建立時套用」；Stable 與 Single-file smoke 皆通過，通知 270/270、媒體 103/103、window layout 通過，安裝程式可編譯。
+- 安裝程式升級以隔離變體實測（不同 AppId、資料夾、mutex，無捷徑、無解除安裝時的通知清理，重新啟動改為記錄參數）：預先放入的舊 `Assets` 被刪除、`/BACKGROUND=1` 時重新啟動參數為 `--background`、未帶時為空、靜默解除安裝移除檔案與登錄。
+- 仍未實測：Ctrl+滾輪縮放的儲存（DevTools 合成的 Ctrl+滾輪不會觸發瀏覽器縮放，需真實輸入）；硬體加速切換後的「立即重新啟動」（新執行個體使用真實 profile，未在本機執行）；睡眠喚醒觸發重試（與網路恢復共用同一排程路徑）。
+
+## 獨立通話視窗與設定頁重新設計（2026-10-01）
 
 - 實機紀錄 `NewWindowRequested Code=121` 證實 Instagram 以 www 網域、路徑含 call 的 popup 開啟通話；舊版把它導到主視窗。現在改為 SDK `NewWindow` 的獨立 `CallWindow`（同一 Environment/Profile，保留 `window.opener`）。
 - 媒體測試擴充為 103 項（Stable publish 通過）：通話視窗開啟、主畫面不變、opener 雙向、共用權限流程、關閉開關停止通話視窗擷取（關閉鏡頭會結束同一次請求的所有 track，麥克風授權保留）、`window.close()` 只關通話視窗、等待詢問時關閉視窗、非通話與不可信 popup 維持原行為、服務釋放時關閉通話視窗；通話視窗全程使用離線 fixture。

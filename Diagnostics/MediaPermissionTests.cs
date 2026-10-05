@@ -396,7 +396,7 @@ internal static class MediaPermissionTests
         {
             if (mic is bool m) settings.Current.AllowMicrophone = m;
             if (cam is bool c) settings.Current.AllowCamera = c;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
         }
         async Task SetBothAsync(CoreWebView2PermissionKind kind, CoreWebView2PermissionState state)
         {
@@ -622,14 +622,14 @@ internal static class MediaPermissionTests
             check(await Capture(true, true) == "ok:audio/live,video/live", "live call-like stream before backgrounding");
             settings.Current.AppNotifications = false;
             settings.Current.BackgroundLowMemory = true;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
             service.SetBackground(true);
             await Task.Delay(2500);
             check((!service.MemoryApiAvailable || Web().MemoryUsageTargetLevel == CoreWebView2MemoryUsageTargetLevel.Low) && !Web().IsSuspended &&
                 await TracksAsync(Web()) == "audio/live,video/live", "tray with notifications off: low memory keeps capture live");
             service.SetBackground(false);
             settings.Current.AppNotifications = true;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
             service.SetBackground(true);
             await Task.Delay(1000);
             check((!service.MemoryApiAvailable || Web().MemoryUsageTargetLevel == CoreWebView2MemoryUsageTargetLevel.Normal) &&
@@ -668,13 +668,13 @@ internal static class MediaPermissionTests
                 "call window asks through the same permission flow and captures");
             settings.Current.AppNotifications = false;
             settings.Current.BackgroundLowMemory = true;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
             service.SetBackground(true);
             check(!service.MemoryApiAvailable || Web().MemoryUsageTargetLevel == CoreWebView2MemoryUsageTargetLevel.Normal,
                 "main page stays at normal memory while a call window is open");
             service.SetBackground(false);
             settings.Current.AppNotifications = true;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
             await ApplyAsync(cam: false);
             // Runtime fact: revoking one device ends every track of that
             // getUserMedia request; the other device's grant is kept.

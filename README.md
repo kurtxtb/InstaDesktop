@@ -8,20 +8,41 @@
 
 - Native Windows experience for [Instagram](https://www.instagram.com/)
 - WebView2-based; no Electron, Node.js runtime, or private Instagram API
-- System tray, single-instance behavior, and persistent window layout
+- System tray, single-instance behavior, and persistent window layout and zoom
+- Recovers by itself after a failed load, a lost connection or a browser crash
 - Windows desktop DM notifications with native payloads, conservative DOM fallback, and safe thread activation
-- Editable CSS and JavaScript assets
+- Unread message count on the taskbar button, tray icon and window title; the taskbar button flashes for a new message
+- Pause notifications from the tray (1 hour, 8 hours, until tomorrow morning), mute one conversation from its notification, an optional notification sound, and an option to hide message content
+- A separate messages window (Ctrl+Shift+M) next to whatever else is open
+- Light or dark, following Windows; English or Traditional Chinese (繁體中文) interface
+- Taskbar jump list: open a section or the messages window, pause or resume notifications
+- Downloads saved straight to your Downloads folder (or one you choose), or ask each time
+- Calls in their own window, optionally always on top
 - Self-contained, single-file, and automatic GitHub Release updates
 
 ## 📦 Install
 
-Download **`InstaDesktop-Setup.exe`** from [Releases](https://github.com/kurtxtb/InstaDesktop/releases), then run it. The per-user installer requires no administrator rights, preserves your profile and custom `Assets`, and upgrades in place.
+Download **`InstaDesktop-Setup.exe`** from [Releases](https://github.com/kurtxtb/InstaDesktop/releases), then run it. The per-user installer requires no administrator rights, preserves your profile and settings, and upgrades in place.
 
 > Microsoft Edge WebView2 Evergreen Runtime is required. Install it from the [official download page](https://developer.microsoft.com/microsoft-edge/webview2/) if needed.
 
 ## 🚀 Automatic updates
 
-At startup, InstaDesktop checks the latest GitHub Release for `InstaDesktop-Setup.exe`. A newer version is downloaded, optionally verified with SHA-256, silently installed, and the app is restarted. The default repository is `kurtxtb/InstaDesktop`.
+At startup, and every 6 hours while it runs, InstaDesktop checks the latest GitHub Release for `InstaDesktop-Setup.exe`. A newer version is downloaded, verified with SHA-256, silently installed, and the app is restarted. A release found while the app is running is installed only while the window is hidden or minimized and no call is open; an app that was in the tray returns to the tray. After an update, a notice links to the release notes. The default repository is `kurtxtb/InstaDesktop`.
+
+Turn off **Settings > Updates > Install updates automatically** to decide yourself: InstaDesktop then tells you when a new version is available, and installs it when you click the notice or **Check for updates**.
+
+## ⌨️ Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+1 / 2 / 3 / 4 | Home / Messages / Reels / Explore |
+| Ctrl+Shift+M | Messages window |
+| Ctrl+= / Ctrl+- / Ctrl+0 (or Ctrl+wheel) | Zoom in / out / reset (remembered) |
+| F5 or Ctrl+R | Reload |
+| Alt+Left / Alt+Right | Back / Forward |
+| Ctrl+, | Settings |
+| F12 | Developer tools (when enabled in Settings) |
 
 ## 🛠️ Build from source
 
@@ -38,7 +59,7 @@ Requirements: Windows 10 1809 or newer / Windows 11 x64, [.NET SDK 8.0.300+](htt
 | Installer | `publish\\installer\\InstaDesktop-Setup.exe` |
 | Single-file app | `publish\\single-file\\InstaDesktop.exe` |
 
-Building does not update an existing installation. To repair a local installation after verification, use `scripts/repair-local-install.ps1` with the actual absolute `-InstallDirectory` and existing `-ShortcutPath`; add `-WhatIf` to preview the update. It backs up replaced files and repairs the shortcut while retaining your profile, settings, and existing custom Assets.
+Building does not update an existing installation. To repair a local installation after verification, use `scripts/repair-local-install.ps1` with the actual absolute `-InstallDirectory` and existing `-ShortcutPath`; add `-WhatIf` to preview the update. It backs up replaced files and repairs the shortcut while retaining your profile and settings.
 
 ## 🔐 Privacy
 
@@ -60,7 +81,7 @@ Calls need three separate permissions: the **Allow microphone / Allow camera** s
 ## 📁 Project layout
 
 ```text
-Assets/                    Editable scripts, styles, and icons
+Assets/                    Page scripts, emoji font and icon (built into the app)
 Services/                  WebView, settings, logging, and update services
 installer/InstaDesktop.iss Inno Setup definition
 build-release.bat          Build and publish stable output

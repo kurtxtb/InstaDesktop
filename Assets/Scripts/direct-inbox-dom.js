@@ -220,5 +220,23 @@
     return result;
   }
 
-  window.__InstaDesktopInboxDom = Object.freeze({ readRows });
+  // The unread count on Instagram's own Messages link, or null when that link
+  // is not shown. Only a Messages/inbox link qualifies: a count in
+  // document.title can also represent likes or other activity.
+  function readUnreadBadge() {
+    const links = document.querySelectorAll('a[href="/direct/inbox/"],a[href="/direct/inbox"],a[href="/direct/"],a[href="https://www.instagram.com/direct/inbox/"]');
+    let found = false, count = 0;
+    for (const link of links) {
+      if (!link.getClientRects().length) continue;
+      found = true;
+      for (const el of link.querySelectorAll('span, [data-count], [data-unread-count]')) {
+        const raw = el.getAttribute('data-unread-count') ?? el.getAttribute('data-count') ??
+          (el.children.length === 0 ? el.textContent : '');
+        if (/^\s*[0-9]{1,4}\+?\s*$/.test(raw || '')) count = Math.max(count, parseInt(raw, 10));
+      }
+    }
+    return found ? count : null;
+  }
+
+  window.__InstaDesktopInboxDom = Object.freeze({ readRows, readUnreadBadge });
 })();

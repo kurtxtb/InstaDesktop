@@ -18,6 +18,8 @@ public sealed class AutoUpdateService
 {
     internal const string LatestReleaseUrl = "https://api.github.com/repos/kurtxtb/InstaDesktop/releases/latest";
     internal const string InstallerName = "InstaDesktop-Setup.exe";
+    internal static string ReleasePage(Version version) =>
+        "https://github.com/kurtxtb/InstaDesktop/releases/tag/v" + version.ToString(3);
     private static readonly HttpClient Client = CreateClient();
 
     internal sealed record UpdateInfo(Version Version, Uri InstallerUri, string Sha256);
@@ -30,7 +32,17 @@ public sealed class AutoUpdateService
         return client;
     }
 
-    public async Task<bool> TryUpdateAsync(CancellationToken cancellationToken = default)
+    // Check and install in one step (startup). background: relaunch into the tray.
+    public async Task<bool> TryUpdateAsync(bool background, CancellationToken cancellationToken = default)
+    {
+        if (await CheckAsync(cancellationToken) is not { } update ||
+            await DownloadAsync(update, cancellationToken) is not { } installer) return false;
+        Launch(installer, background);
+        return true;
+    }
+
+    // Returns a newer, verified-looking release, or null when there is none.
+    internal async Task<UpdateInfo?> CheckAsync(CancellationToken cancellationToken = default)
     {
         string? manifestUrl = Environment.GetEnvironmentVariable("INSTA_UPDATE_MANIFEST_URL");
         string localUrlFile = Path.Combine(AppContext.BaseDirectory, "UpdateManifestUrl.txt");
@@ -38,7 +50,7 @@ public sealed class AutoUpdateService
             manifestUrl = (await File.ReadAllTextAsync(localUrlFile, cancellationToken)).Trim();
         if (string.IsNullOrWhiteSpace(manifestUrl)) manifestUrl = LatestReleaseUrl;
         if (!Uri.TryCreate(manifestUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
-            return false;
+            return null;
 
         LoggingService.Write(LogEvent.UpdateCheck);
         string json;
@@ -49,16 +61,21 @@ public sealed class AutoUpdateService
         if (Parse(json, requireGitHubHost: manifestUrl == LatestReleaseUrl) is not { } update)
         {
             LoggingService.Write(LogEvent.UpdateUnavailable, code: 1);
-            return false;
+            return null;
         }
         if (!IsNewer(update.Version, current))
         {
             LoggingService.Write(LogEvent.UpdateUnavailable, code: 0);
-            return false;
+            return null;
         }
         LoggingService.Write(LogEvent.UpdateAvailable, code: update.Version.Major * 10000 + update.Version.Minor * 100 + update.Version.Build);
+        return update;
+    }
 
-        string installer = Path.Combine(Path.GetTempPath(), $"InstaDesktop-Setup-{update.Version}.exe");
+    // Downloads the installer and returns its path once the SHA-256 matches.
+    internal async Task<string?> DownloadAsync(UpdateInfo update, CancellationToken cancellationToken = default)
+    {
+        string installer = Path.Combine(Path.GetTempPath(), $"{DownloadPrefix}{update.Version}.exe");
         await using (var source = await Client.GetStreamAsync(update.InstallerUri, cancellationToken))
         await using (var target = File.Create(installer))
             await source.CopyToAsync(target, cancellationToken);
@@ -69,13 +86,37 @@ public sealed class AutoUpdateService
         {
             File.Delete(installer);
             LoggingService.Write(LogEvent.UpdateVerificationFailed);
-            return false;
+            return null;
         }
+        return installer;
+    }
+
+    internal static void Launch(string installer, bool background)
+    {
         // The installer waits for this process to exit, upgrades in place and
-        // starts the new version again (RELAUNCH=1).
-        Process.Start(new ProcessStartInfo(installer, "/SILENT /NORESTART /CLOSEAPPLICATIONS /RELAUNCH=1") { UseShellExecute = true });
-        LoggingService.Write(LogEvent.UpdateLaunched);
-        return true;
+        // starts the new version again (RELAUNCH=1), in the tray if BACKGROUND=1.
+        string arguments = "/SILENT /NORESTART /CLOSEAPPLICATIONS /RELAUNCH=1" + (background ? " /BACKGROUND=1" : "");
+        Process.Start(new ProcessStartInfo(installer, arguments) { UseShellExecute = true });
+        LoggingService.Write(LogEvent.UpdateLaunched, code: background ? 1 : 0);
+    }
+
+    private const string DownloadPrefix = "InstaDesktop-Setup-";
+
+    // Installers from earlier updates; the one still running (if any) is skipped.
+    public static void DeleteOldDownloads()
+    {
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(Path.GetTempPath(), DownloadPrefix + "*.exe"))
+            {
+                try { File.Delete(file); }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            LoggingService.Write(LogEvent.UpdateCleanupFailed, error);
+        }
     }
 
     // Accepts the GitHub "latest release" response (tag_name, assets[].name,

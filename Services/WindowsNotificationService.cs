@@ -99,6 +99,11 @@ internal sealed class WindowsNotificationService : IWindowsNotificationPresenter
             if (avatar is not null) builder.AddAppLogoOverride(new Uri(avatar), ToastGenericAppLogoCrop.Circle);
             if (image is not null) builder.AddHeroImage(new Uri(image));
             if (n.Silent) builder.AddAudio(new ToastAudio { Silent = true });
+            // Only a known conversation can be muted; the click is handled in the background.
+            if (n.ThreadUrl is not null)
+                builder.AddButton(new ToastButton().SetContent(InstaDesktop.Localization.Loc.T("Notify.Mute"))
+                    .AddArgument("action", "mute").AddArgument("notification", token).AddArgument("thread", n.ThreadUrl)
+                    .SetBackgroundActivation());
             var toast = new ToastNotification(builder.GetToastContent().GetXml())
             {
                 Tag = token, Group = "instagram", SuppressPopup = replace,

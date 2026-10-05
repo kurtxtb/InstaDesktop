@@ -16,7 +16,7 @@ Sources now enter `NotificationService` as `InstagramNotification` records:
 4. **Global unread badge** watches numeric counts inside the inbox navigation link on any Instagram route. It supplies generic wording when no detailed row transition is available.
 5. **Background Direct inbox** is an optional enrichment source added incrementally on 2026-09-14; see the patch notes below. It uses the same coordinator, deduplicator, image cache and Windows presenter.
 
-The bridge is an embedded asset independent of optional UI customization. Installer-preserved editable assets cannot leave an obsolete bridge installed. The host accepts only a small JSON object contract (16 KiB maximum, bounded depth/fields, exact expected Instagram HTTPS origins). Invalid types, sources, unread flags and Direct URLs are rejected.
+The bridge is an embedded asset, so an upgrade always replaces it. The host accepts only a small JSON object contract (16 KiB maximum, bounded depth/fields, exact expected Instagram HTTPS origins). Invalid types, sources, unread flags and Direct URLs are rejected.
 
 ## DOM initialization and false-positive controls
 
@@ -66,7 +66,7 @@ Verified on 2026-09-13 with SDK 8.0.301, self-contained runtime .NET 8.0.29 and 
 | Same runner against SingleFile publish | 78 checks passed |
 | `node --check Assets/Scripts/notifications.js` | Passed |
 | `git diff --check` | Passed |
-| Existing `scripts/verify.ps1` | Starts, restores settings, loads signed-out Instagram; stops at the existing `CSS and JavaScript injection` assertion. MainWindow already forces `UiCustomization=false`, while this older test still expects injected customization. This unrelated assertion was not removed to mask the failure. |
+| Existing `scripts/verify.ps1` | At the time: stopped at the old `CSS and JavaScript injection` assertion. The unused customization layer was later removed and the smoke test rewritten; it passes since 2026-10-05 (see VERIFICATION.md). |
 
 Reports are written to `artifacts/verification/notifications.json`, `notifications-single-file.json`, and `legacy-smoke-notification-change.json`. Windows presentation is mocked in the notification suite, whereas DOM mutation/permission/memory checks and native WebView shown/clicked/dismissed/web-close callbacks execute against the actual WebView2 runtime. Real Windows banner visibility, COM cold activation and signed-in Instagram receipt remain manual tests.
 

@@ -39,15 +39,33 @@ public sealed class SettingsService
         var snapshot = settings.Copy();
         snapshot.Normalize();
         await _writeGate.WaitAsync();
+        try { await WriteAsync(snapshot); }
+        finally { _writeGate.Release(); }
+        Changed?.Invoke();
+    }
+
+    // Changes only the given fields of the latest settings, so independent
+    // background writers (window placement, zoom) cannot undo each other.
+    public async Task UpdateAsync(System.Action<AppSettings> change)
+    {
+        await _writeGate.WaitAsync();
         try
         {
-            Directory.CreateDirectory(AppPaths.Root);
-            string temporary = AppPaths.Settings + ".tmp";
-            await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(snapshot, JsonOptions));
-            File.Move(temporary, AppPaths.Settings, overwrite: true);
-            Current = snapshot;
+            var snapshot = Current.Copy();
+            change(snapshot);
+            snapshot.Normalize();
+            await WriteAsync(snapshot);
         }
         finally { _writeGate.Release(); }
         Changed?.Invoke();
+    }
+
+    private async Task WriteAsync(AppSettings snapshot)
+    {
+        Directory.CreateDirectory(AppPaths.Root);
+        string temporary = AppPaths.Settings + ".tmp";
+        await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(snapshot, JsonOptions));
+        File.Move(temporary, AppPaths.Settings, overwrite: true);
+        Current = snapshot;
     }
 }

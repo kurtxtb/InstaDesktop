@@ -6,9 +6,9 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
-using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Shell;
+using InstaDesktop.Localization;
 using InstaDesktop.Models;
 using InstaDesktop.Services;
 using Forms = System.Windows.Forms;
@@ -31,57 +31,51 @@ public partial class MainWindow : Window
     private bool _trayHintShown;
     private bool _lastMaximized;
     internal WebViewService Web => _web;
-    public static readonly DependencyProperty IsSidebarCompactProperty = DependencyProperty.Register(
-        nameof(IsSidebarCompact), typeof(bool), typeof(MainWindow), new PropertyMetadata(false));
-    public bool IsSidebarCompact { get => (bool)GetValue(IsSidebarCompactProperty); private set => SetValue(IsSidebarCompactProperty, value); }
-    internal NavigationSection SelectedSection { get; private set; } = NavigationSection.Home;
     private bool _mediaFullscreen;
     private WindowState _beforeFullscreenState;
     private Rect _beforeFullscreenBounds;
     private WindowChrome? _windowedChrome;
 
-    public MainWindow(SettingsService settings, bool startInBackground)
+    private readonly AppCommand _startCommand;
+
+    public MainWindow(SettingsService settings, bool startInBackground, AppCommand startCommand = AppCommand.None)
     {
         _settings = settings;
         _startInBackground = startInBackground;
+        _startCommand = startCommand;
         InitializeComponent();
         RestoreWindow();
-        Notifications = new NotificationService(Dispatcher, () => _settings.Current.AppNotifications, thread =>
+        Notifications = new NotificationService(Dispatcher, () => NotificationsActive, thread =>
         {
             ShowFromTray();
             _web?.NavigateNotificationThread(thread);
-        });
+        })
+        {
+            SoundEnabled = () => _settings.Current.NotificationSound,
+            HideContent = () => _settings.Current.HideNotificationContent,
+            IsMuted = thread => _settings.Current.IsMuted(thread, DateTimeOffset.UtcNow)
+        };
+        Notifications.Presented += FlashForNewMessage;
+        Notifications.MuteRequested += thread => _ = MuteConversationAsync(thread);
         _web = new WebViewService(BrowserHost, this, settings, Notifications);
-        // Keep the original Instagram page and native Emoji rendering. The
-        // optional customization pipeline stays disabled for the default UI.
-        _settings.Current.UiCustomization = false;
-        _settings.Current.CompactInstagramLayout = false;
-        _settings.Changed += SettingsChanged;
-        SettingsChanged();
-        _web.RouteChanged += SetSelectedSection;
-        _web.HistoryChanged += (back, forward) => { BackButton.IsEnabled = back; ForwardButton.IsEnabled = forward; };
         _web.FullscreenChanged += SetMediaFullscreen;
         _web.UserNotice += ShowNotice;
         _web.MediaBlocked += ShowMediaBlocked;
-        SetSelectedSection(NavigationSection.Home);
+        _web.ZoomChanged += ShowZoom;
+        _web.UnreadCountChanged += _ => UpdateUnreadBadge();
+        _settings.Changed += SettingsChanged;
+        ThemeService.WindowsThemeChanged += WindowsThemeChanged;
         _web.StatusChanged += (message, recoverable) =>
         {
             StatusText.Text = message;
-            StatusHeading.Text = recoverable ? "Unable to load Instagram" : "Your Instagram, at home.";
+            StatusHeading.Text = Loc.T(recoverable ? "Main.HeadingError" : "Main.Heading");
             if (BrowserHost.Visibility == Visibility.Visible) StatusPanel.Visibility = Visibility.Visible;
             RecoveryActions.Visibility = recoverable ? Visibility.Visible : Visibility.Collapsed;
-            RuntimeButton.Visibility = message.Contains("Runtime is required", StringComparison.Ordinal)
-                ? Visibility.Visible : Visibility.Collapsed;
+            RuntimeButton.Visibility = _web.RuntimeMissing ? Visibility.Visible : Visibility.Collapsed;
         };
         _web.Ready += () => StatusPanel.Visibility = Visibility.Collapsed;
         _web.ShowRequested += ShowFromTray;
         _web.CloseRequested += Close;
-        _web.InjectionFailed += () =>
-        {
-            _balloonOpensSettings = false;
-            _tray?.ShowBalloonTip(5000, "UI customization could not load",
-                "Instagram is still available. Check your CSS / JavaScript files and app log.", Forms.ToolTipIcon.Warning);
-        };
         SourceInitialized += (_, _) =>
         {
             HwndSource.FromHwnd(new WindowInteropHelper(this).Handle).AddHook(WindowMessages);
@@ -115,23 +109,37 @@ public partial class MainWindow : Window
         await _web.InitializeAsync();
         if (_startInBackground) { HideToTray(showHint: false); Opacity = 1; ShowInTaskbar = true; }
         UpdateBackgroundState();
+        if (_startCommand != AppCommand.None) RunCommand(_startCommand);
     }
 
-    private void CreateTray()
+    // A taskbar jump list entry (or the same command-line argument).
+    internal void RunCommand(AppCommand command)
     {
-        var menu = new Forms.ContextMenuStrip();
-        menu.Items.Add("Open Instagram", null, (_, _) => ShowFromTray());
-        menu.Items.Add("Refresh", null, async (_, _) => await RunActionAsync(_web.ReloadAsync));
-        menu.Items.Add(new Forms.ToolStripSeparator());
-        menu.Items.Add("Settings...", null, (_, _) => ShowSettings());
-        menu.Items.Add("Reload customization", null, async (_, _) => await RunActionAsync(_web.ReloadCustomizationAsync));
-        menu.Items.Add(new Forms.ToolStripSeparator());
-        menu.Items.Add("Exit", null, async (_, _) => await ExitAsync());
-        _trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? (Icon)SystemIcons.Application.Clone();
-        _tray = new Forms.NotifyIcon { Icon = _trayIcon, Text = "InstaDesktop", Visible = true, ContextMenuStrip = menu };
-        _tray.DoubleClick += (_, _) => ShowFromTray();
-        _tray.BalloonTipClicked += (_, _) => { if (_balloonOpensSettings) ShowSettings(); };
-        _tray.BalloonTipClosed += (_, _) => _balloonOpensSettings = false;
+        if (_disposed) return;
+        switch (command)
+        {
+            case AppCommand.Home or AppCommand.Messages or AppCommand.Reels or AppCommand.Explore:
+                ShowFromTray();
+                var section = command switch
+                {
+                    AppCommand.Messages => NavigationSection.Messages, AppCommand.Reels => NavigationSection.Reels,
+                    AppCommand.Explore => NavigationSection.Explore, _ => NavigationSection.Home
+                };
+                _ = RunActionAsync(() => _web.NavigateSectionAsync(section));
+                break;
+            case AppCommand.MessagesWindow:
+                _ = RunActionAsync(_web.OpenMessagesWindowAsync);
+                break;
+            case AppCommand.Pause1h:
+                var until = DateTimeOffset.Now.AddHours(1);
+                _ = PauseNotificationsAsync(until);
+                ShowBalloon(Loc.T("Main.PausedTitle"), Loc.F("Main.PausedUntil", FormatTime(until)), null, milliseconds: 3000);
+                break;
+            case AppCommand.Resume:
+                _ = PauseNotificationsAsync(null);
+                ShowBalloon(Loc.T("Main.Resumed"), Loc.T("Main.ResumedText"), null, milliseconds: 3000);
+                break;
+        }
     }
 
     public void ShowFromTray()
@@ -152,9 +160,7 @@ public partial class MainWindow : Window
         if (showHint && !_trayHintShown)
         {
             _trayHintShown = true;
-            _balloonOpensSettings = false;
-            _tray?.ShowBalloonTip(3000, "InstaDesktop is running in the tray",
-                "Right-click the tray icon for Settings or Exit.", Forms.ToolTipIcon.Info);
+            ShowBalloon(Loc.T("Main.TrayHintTitle"), Loc.T("Main.TrayHintText"), null, milliseconds: 3000);
         }
     }
 
@@ -196,18 +202,45 @@ public partial class MainWindow : Window
 
     internal void PrepareForShutdown() => _exiting = true;
 
+    // Starts a new instance that waits for this one to release the
+    // single-instance lock, then exits normally.
+    internal async Task RestartAsync()
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!,
+                App.RelaunchArgument + (IsVisible ? "" : " --background")) { UseShellExecute = false });
+        }
+        catch (Exception error)
+        {
+            LoggingService.Write(LogEvent.UnexpectedException, error);
+            MessageBox.Show(this, Loc.T("Main.RestartFailed"), "InstaDesktop");
+            return;
+        }
+        await ExitAsync();
+    }
+
+    // An update may restart the app only while it is out of the way.
+    internal bool IsIdleForUpdate => !_disposed && !_exiting && (!IsVisible || WindowState == WindowState.Minimized) &&
+        _settingsWindow is null && _web.CallWindows.Count == 0 && _web.MessagesWindow is not { IsVisible: true };
+
     internal async Task SavePlacementAsync()
     {
         if (_mediaFullscreen) return;
-        var settings = _settings.Current.Copy();
         Rect bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
-        if (!bounds.IsEmpty)
+        bool maximized = _lastMaximized;
+        try
         {
-            settings.Left = bounds.Left; settings.Top = bounds.Top;
-            settings.Width = bounds.Width; settings.Height = bounds.Height;
+            await _settings.UpdateAsync(settings =>
+            {
+                if (!bounds.IsEmpty)
+                {
+                    settings.Left = bounds.Left; settings.Top = bounds.Top;
+                    settings.Width = bounds.Width; settings.Height = bounds.Height;
+                }
+                settings.Maximized = maximized;
+            });
         }
-        settings.Maximized = _lastMaximized;
-        try { await _settings.SaveAsync(settings); }
         catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
     }
 
@@ -249,7 +282,7 @@ public partial class MainWindow : Window
         if (!_mediaFullscreen && WindowState != WindowState.Minimized) _lastMaximized = WindowState == WindowState.Maximized;
         UpdateWindowFrame();
         if (MaximizeIcon is not null) MaximizeIcon.Data = Geometry.Parse(WindowState == WindowState.Maximized ? "M3,0 H10 V7 M0,3 H7 V10 H0 Z" : "M0,0 H10 V10 H0 Z");
-        if (MaximizeButton is not null) MaximizeButton.ToolTip = WindowState == WindowState.Maximized ? "Restore" : "Maximize";
+        if (MaximizeButton is not null) MaximizeButton.ToolTip = Loc.T(WindowState == WindowState.Maximized ? "Main.Restore" : "Main.Maximize");
         UpdateBackgroundState();
         if (_initialized && !_disposed) await SavePlacementAsync();
     }
@@ -326,10 +359,16 @@ public partial class MainWindow : Window
             action = () => { ShowSettings(); return Task.CompletedTask; };
         else if (key == Key.F12 && _settings.Current.DeveloperTools)
             action = () => { _web.Core?.OpenDevToolsWindow(); return Task.CompletedTask; };
+        else if (modifiers == (ModifierKeys.Control | ModifierKeys.Shift) && key == Key.M)
+            action = _web.ToggleMessagesWindowAsync;
         else if (modifiers == ModifierKeys.Control && key >= Key.D1 && key <= Key.D4)
-            action = () => NavigateSectionAsync((NavigationSection)(key - Key.D1));
-        else if (modifiers == (ModifierKeys.Control | ModifierKeys.Shift) && key == Key.R)
-            action = _web.ReloadCustomizationAsync;
+            action = () => _web.NavigateSectionAsync((NavigationSection)(key - Key.D1));
+        else if ((modifiers & ~ModifierKeys.Shift) == ModifierKeys.Control && key is Key.OemPlus or Key.Add)
+            action = () => { _web.StepZoom(+1); return Task.CompletedTask; };
+        else if ((modifiers & ~ModifierKeys.Shift) == ModifierKeys.Control && key is Key.OemMinus or Key.Subtract)
+            action = () => { _web.StepZoom(-1); return Task.CompletedTask; };
+        else if (modifiers == ModifierKeys.Control && key is Key.D0 or Key.NumPad0)
+            action = () => { _web.ResetZoom(); return Task.CompletedTask; };
         else if (key == Key.Escape && _mediaFullscreen)
             action = async () => { if (_web.Core is { } core) await core.ExecuteScriptAsync("if(document.fullscreenElement) document.exitFullscreen();"); SetMediaFullscreen(false); };
         if (action is null) return;
@@ -355,6 +394,8 @@ public partial class MainWindow : Window
         if (_disposed) return;
         _disposed = true;
         _settings.Changed -= SettingsChanged;
+        ThemeService.WindowsThemeChanged -= WindowsThemeChanged;
+        _pauseTimer?.Stop();
         Notifications.Dispose();
         _web.Dispose();
         if (_tray is not null)
@@ -364,96 +405,44 @@ public partial class MainWindow : Window
             _tray.Dispose();
         }
         _trayIcon?.Dispose();
+        DisposeTrayBadge();
     }
 
+    private void ShowZoom(double factor)
+    {
+        int percent = (int)Math.Round(factor * 100);
+        ZoomText.Text = percent + "%";
+        ZoomButton.Visibility = percent == 100 ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void ZoomReset_Click(object sender, RoutedEventArgs e) => _web.ResetZoom();
+
+    private void ShowNotice(string message) => ShowBalloon("Instagram", message.Replace('\n', ' '), null, milliseconds: 5000);
+    private async void MessagesWindow_Click(object sender, RoutedEventArgs e) => await RunActionAsync(_web.ToggleMessagesWindowAsync);
+
+    // Settings saved (or a background field changed): refresh what they drive.
     private void SettingsChanged()
     {
+        if (!Dispatcher.CheckAccess()) { Dispatcher.BeginInvoke(new Action(SettingsChanged)); return; }
         if (_disposed) return;
-        // Original Instagram mode: the WebView owns the page navigation. Keep
-        // the legacy Native sidebar collapsed so it cannot leave a black gutter.
-        IsSidebarCompact = true;
-        SidebarColumn.Width = new GridLength(0);
-        Sidebar.Visibility = Visibility.Collapsed;
+        UpdateUnreadBadge();
+        SchedulePauseEnd();
     }
-
-    private void Window_SizeChanged(object sender, SizeChangedEventArgs e) { if (SidebarColumn is not null) SettingsChanged(); }
-    private async void CollapseSidebar_Click(object sender, RoutedEventArgs e)
-    {
-        var next = _settings.Current.Copy();
-        next.SidebarMode = next.SidebarMode == SidebarMode.Expanded ? SidebarMode.Compact : SidebarMode.Expanded;
-        await RunActionAsync(() => _settings.SaveAsync(next));
-    }
-    private async void Navigation_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is RadioButton button && Enum.TryParse<NavigationSection>(button.Tag as string, out var section))
-            await RunActionAsync(() => NavigateSectionAsync(section));
-    }
-    internal Task NavigateSectionAsync(NavigationSection section)
-    {
-        NoticePanel.Visibility = Visibility.Collapsed;
-        NativePageTitle.Text = InstagramRoutes.TitleFor(section);
-        NativePageSubtitle.Text = section switch
-        {
-            NavigationSection.Home => "Your space, redesigned for Windows.",
-            NavigationSection.Messages => "Private conversations in a focused desktop workspace.",
-            NavigationSection.Reels => "Short videos, presented in a clean native layout.",
-            NavigationSection.Explore => "Discover something new.",
-            NavigationSection.Search => "Find people and ideas.",
-            NavigationSection.Notifications => "Stay up to date with your activity.",
-            NavigationSection.Profile => "Your profile and account settings.",
-            NavigationSection.Create => "Create and share something new.",
-            _ => "Instagram desktop workspace."
-        };
-        NativeEmptyTitle.Text = section == NavigationSection.Create ? "Create a post" : $"{InstagramRoutes.TitleFor(section)} is ready";
-        NativeEmptyText.Text = "This is a native InstaDesktop view. Instagram's web page is not displayed here.";
-        return Task.CompletedTask;
-    }
-
-    private void NativeCreate_Click(object sender, RoutedEventArgs e) => _ = NavigateSectionAsync(NavigationSection.Create);
-    private void NativeSignIn_Click(object sender, RoutedEventArgs e) => _ = RunActionAsync(() => _web.NavigateSectionAsync(NavigationSection.Home));
-    internal void SetSelectedSection(NavigationSection section)
-    {
-        SelectedSection = section;
-        SectionTitle.Text = InstagramRoutes.TitleFor(section);
-        foreach (var button in new[] { HomeNav, MessagesNav, ReelsNav, ExploreNav, SearchNav, NotificationsNav, ProfileNav, CreateNav })
-            button.IsChecked = string.Equals(button.Tag as string, section.ToString(), StringComparison.Ordinal);
-    }
-    private void ShowNotice(string message)
-    {
-        // Notifications use the native tray surface; navigation notices stay silent.
-        if (message.Contains('\n'))
-        {
-            _balloonOpensSettings = false;
-            _tray?.ShowBalloonTip(5000, "Instagram", message.Replace('\n', ' '), Forms.ToolTipIcon.Info);
-        }
-        NoticePanel.Visibility = Visibility.Collapsed;
-    }
-    private bool _balloonOpensSettings;
 
     // Low-key and actionable: one tray notice (throttled by WebViewService),
     // clicking it opens Settings. No modal dialog interrupts the call screen.
     private void ShowMediaBlocked(Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind kind)
     {
-        if (_tray is null) return;
-        string device = kind == Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind.Camera ? "camera" : "microphone";
-        _balloonOpensSettings = true;
-        _tray.ShowBalloonTip(8000, "Instagram call blocked",
-            "Instagram asked to use your " + device + ", but it is turned off in InstaDesktop. Click to open Settings.", Forms.ToolTipIcon.Info);
+        bool camera = kind == Microsoft.Web.WebView2.Core.CoreWebView2PermissionKind.Camera;
+        ShowBalloon(Loc.T("Main.CallBlockedTitle"), Loc.T(camera ? "Main.CallBlockedCamera" : "Main.CallBlockedMicrophone"),
+            ShowSettings, milliseconds: 8000);
     }
 
-    private void DismissNotice_Click(object sender, RoutedEventArgs e) => NoticePanel.Visibility = Visibility.Collapsed;
     private void Settings_Click(object sender, RoutedEventArgs e) => ShowSettings();
     private void Minimize_Click(object sender, RoutedEventArgs e) => SystemCommands.MinimizeWindow(this);
     private void Maximize_Click(object sender, RoutedEventArgs e) => ToggleMaximize();
     private void ToggleMaximize() { if (WindowState == WindowState.Maximized) SystemCommands.RestoreWindow(this); else SystemCommands.MaximizeWindow(this); }
     private void Close_Click(object sender, RoutedEventArgs e) => Close();
-    private void Back_Click(object sender, RoutedEventArgs e) { if (_web.Core?.CanGoBack == true) _web.Core.GoBack(); }
-    private void Forward_Click(object sender, RoutedEventArgs e) { if (_web.Core?.CanGoForward == true) _web.Core.GoForward(); }
-    private async void WebNavigation_Click(object sender, RoutedEventArgs e)
-    {
-        await RunActionAsync(() => _web.RevealWebNavigationAsync());
-        NoticePanel.Visibility = Visibility.Collapsed;
-    }
     internal void SetMediaFullscreen(bool fullscreen)
     {
         if (_mediaFullscreen == fullscreen) return;
@@ -464,11 +453,7 @@ public partial class MainWindow : Window
         }
         _mediaFullscreen = fullscreen;
         TitleBar.Visibility = fullscreen ? Visibility.Collapsed : Visibility.Visible;
-        Sidebar.Visibility = Toolbar.Visibility = Visibility.Collapsed;
         TitleRow.Height = new GridLength(fullscreen ? 0 : 40);
-        ToolbarRow.Height = new GridLength(0);
-        if (fullscreen) NoticePanel.Visibility = Visibility.Collapsed;
-        SettingsChanged();
         if (fullscreen)
         {
             _windowedChrome = WindowChrome.GetWindowChrome(this);

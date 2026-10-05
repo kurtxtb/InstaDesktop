@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Threading;
+using InstaDesktop.Localization;
 using InstaDesktop.Models;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Toolkit.Uwp.Notifications;
@@ -45,6 +46,37 @@ public sealed class NotificationService : IDisposable
     private bool _disposed;
     private DateTimeOffset _uncertainInboxChange = DateTimeOffset.MinValue;
     internal bool DirectInboxMonitoring { get; set; }
+    // The user's presentation choices. Off: every toast is shown without its sound.
+    internal Func<bool> SoundEnabled { get; set; } = () => true;
+    // On: the toast names the sender only (no message text, no image).
+    internal Func<bool> HideContent { get; set; } = () => false;
+    // A muted Direct thread never shows a toast (checked when it would appear).
+    internal Func<string, bool> IsMuted { get; set; } = _ => false;
+    // A toast's "Mute" button: the validated thread URL to mute.
+    internal event Action<string>? MuteRequested;
+    // A new toast appeared (not an update of one already shown).
+    internal event Action? Presented;
+
+    private bool Muted(Delivery d) => d.Value.ThreadUrl is { } thread && IsMuted(thread);
+
+    private bool Present(Delivery d, string? avatar, string? image, bool replace, bool announce = true)
+    {
+        var n = d.Value;
+        if (!SoundEnabled()) n = n with { Silent = true };
+        if (n.Body == GenericBody) n = n with { Body = Loc.T("Notify.GenericMessage") };
+        if (HideContent())
+        {
+            bool message = n.Type == InstagramNotificationType.DirectMessage || n.ThreadUrl is not null;
+            n = n with { Body = Loc.T(message ? "Notify.HiddenMessage" : "Notify.HiddenActivity"), ImageUrl = null };
+            image = null;
+        }
+        bool shown = _windows.Show(n, d.Token, avatar, image, replace);
+        if (shown && !replace && announce) Presented?.Invoke();
+        return shown;
+    }
+
+    // The placeholder body NotificationPolicy uses when Instagram gave none.
+    private const string GenericBody = "You have a new message";
     internal const int EnrichmentMilliseconds = 2000;
 
     public NotificationService(Dispatcher dispatcher, Func<bool> enabled, Action<string?> activate)
@@ -64,7 +96,7 @@ public sealed class NotificationService : IDisposable
         {
             if (Find(token) is not { } d || d.Closed || !_enabled() || d.TextRetried) return;
             d.TextRetried = true;
-            if (_windows.Show(d.Value, d.Token, null, null, replace: false)) ReportShown(d);
+            if (Present(d, null, null, replace: false, announce: false)) ReportShown(d);
         });
     }
 
@@ -128,8 +160,14 @@ public sealed class NotificationService : IDisposable
             {
                 // A late richer source updates the same Action Center item silently.
                 // A mirrored event adding nothing only joins the native lifecycle.
+                if (Muted(delivery))
+                {
+                    // Enrichment revealed a muted conversation: take the toast back.
+                    Close(delivery, remove: true);
+                    return;
+                }
                 if (delivery.Value != before)
-                    _windows.Show(delivery.Value, delivery.Token, delivery.AvatarPath, delivery.ImagePath, replace: true);
+                    Present(delivery, delivery.AvatarPath, delivery.ImagePath, replace: true);
                 ReportShown(delivery);
             }
             else if (n.Source == NotificationSource.NativeWebView && !NotificationPolicy.CanEnrich(n))
@@ -179,15 +217,21 @@ public sealed class NotificationService : IDisposable
             foreach (var generic in _deliveries.Where(d => d.AwaitingEnrichment &&
                 DateTimeOffset.UtcNow - d.Created >= TimeSpan.FromMilliseconds(EnrichmentMilliseconds)).ToArray()) ResolveEnrichment(generic);
             if (!CanShow(delivery) || delivery.Value.RequiresNativeConfirmation) return;
+            if (Muted(delivery))
+            {
+                LoggingService.Write(LogEvent.NotificationMuted);
+                Close(delivery, remove: false);
+                return;
+            }
             var avatar = _images.GetAsync(delivery.Value.AvatarUrl, _shutdown.Token);
             var image = _images.GetAsync(delivery.Value.ImageUrl, _shutdown.Token);
             await Task.WhenAll(avatar, image);
             if (!CanShow(delivery)) return;
             delivery.AvatarPath = await avatar;
             delivery.ImagePath = await image;
-            delivery.Submitted = _windows.Show(delivery.Value, delivery.Token, delivery.AvatarPath, delivery.ImagePath, replace: false);
+            delivery.Submitted = Present(delivery, delivery.AvatarPath, delivery.ImagePath, replace: false);
             if (!delivery.Submitted && (await avatar is not null || await image is not null))
-                delivery.Submitted = _windows.Show(delivery.Value, delivery.Token, null, null, replace: false);
+                delivery.Submitted = Present(delivery, null, null, replace: false);
             if (delivery.Submitted) ReportShown(delivery);
         }
         catch (OperationCanceledException) { }
@@ -300,6 +344,16 @@ public sealed class NotificationService : IDisposable
             var args = ToastArguments.Parse(arguments);
             if (!args.TryGetValue("notification", out var token) || token.Length != 16 || !token.All(Uri.IsHexDigit)) return;
             string? thread = args.TryGetValue("thread", out var path) ? NotificationPolicy.DirectUrl(path) : null;
+            if (args.TryGetValue("action", out var action) && action == "mute")
+            {
+                // The toast's Mute button: never opens the window.
+                var muted = Find(token);
+                thread = muted?.Value.ThreadUrl ?? thread;
+                if (muted is not null) Close(muted, remove: true);
+                if (thread is not null) MuteRequested?.Invoke(thread);
+                LoggingService.Write(LogEvent.NotificationMuted, code: thread is null ? 0 : 1);
+                return;
+            }
             if (Find(token) is { } d)
             {
                 thread = d.Value.ThreadUrl ?? thread;

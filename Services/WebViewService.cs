@@ -13,6 +13,7 @@ using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using Microsoft.Win32;
+using InstaDesktop.Localization;
 using InstaDesktop.Models;
 
 namespace InstaDesktop.Services;
@@ -25,11 +26,9 @@ public sealed class WebViewService : IDisposable
     private readonly Window _owner;
     private readonly SettingsService _settings;
     private readonly SemaphoreSlim _operation = new(1, 1);
-    private InjectionService _injection = new();
     private bool _disposed;
     private bool _memoryApiAvailable = true;
     private bool _background;
-    private bool _injectionErrorReported;
     private string? _notificationScriptId;
     private string? _pendingNotificationThread;
     private readonly NotificationService _notifications;
@@ -38,6 +37,12 @@ public sealed class WebViewService : IDisposable
     private bool _checkingDirectMonitor, _diagnosticInitialization;
     private DateTimeOffset _nextDirectMonitorAttempt;
     private CoreWebView2MemoryUsageTargetLevel? _memoryTarget;
+    private readonly DispatcherTimer _recoveryTimer, _zoomSave;
+    private int _recoveryAttempt;
+    private ulong _currentNavigationId;
+    private bool _pageLoaded;
+    private bool _callWindowsOnTop;
+    private bool _canAutoRecover;
     // Diagnostics only: lets the isolated notification runner exercise the real
     // monitor lifecycle against offline fixtures. Never set in normal mode.
     internal Action<CoreWebView2>? DiagnosticMonitorConfigure { get; set; }
@@ -60,25 +65,32 @@ public sealed class WebViewService : IDisposable
     private readonly Dictionary<CoreWebView2, int> _documentEpochs = new();
     private readonly List<CallWindow> _callWindows = new();
     internal IReadOnlyList<CallWindow> CallWindows => _callWindows;
+    private IEnumerable<PopoutWindow> Popouts => _messagesWindow is { } messages ? _callWindows.Append<PopoutWindow>(messages) : _callWindows;
     internal static TimeSpan BlockedNoticeInterval { get; set; } = TimeSpan.FromSeconds(60);
     // Raised (throttled) when a call is blocked by a desktop switch that is off.
     public event Action<CoreWebView2PermissionKind>? MediaBlocked;
     private bool MonitorAllowed => _settings.Current.AppNotifications &&
         (!_diagnosticInitialization || DiagnosticMonitorConfigure is not null);
     public WebView2? View { get; private set; }
-    public CoreWebView2? Core => View?.CoreWebView2;
+    // After the browser process exits, the WPF control throws on CoreWebView2;
+    // keep our own reference so recovery can still tear the old view down.
+    private CoreWebView2? _primaryCore;
+    public CoreWebView2? Core => _primaryCore;
     public bool NeedsRecovery { get; private set; }
+    // The failure is a missing WebView2 Runtime (the status offers its download).
+    public bool RuntimeMissing { get; private set; }
     public bool MemoryApiAvailable => _memoryApiAvailable;
     public string? LastFailure { get; private set; }
     public event Action<string, bool>? StatusChanged;
     public event Action? Ready;
     public event Action? ShowRequested;
     public event Action? CloseRequested;
-    public event Action? InjectionFailed;
-    public event Action<NavigationSection>? RouteChanged;
-    public event Action<bool, bool>? HistoryChanged;
     public event Action<bool>? FullscreenChanged;
     public event Action<string>? UserNotice;
+    public event Action<double>? ZoomChanged;
+    // Instagram's Messages unread count (0 when signed out).
+    public event Action<int>? UnreadCountChanged;
+    public int UnreadCount { get; private set; }
     public NavigationSection CurrentSection { get; private set; } = NavigationSection.Home;
 
     public WebViewService(Grid host, Window owner, SettingsService settings, NotificationService notifications)
@@ -90,6 +102,15 @@ public sealed class WebViewService : IDisposable
         _directMonitorCheck = new DispatcherTimer(TimeSpan.FromSeconds(30), DispatcherPriority.Background,
             async (_, _) => await RefreshDirectMonitorAsync(), owner.Dispatcher);
         _directMonitorCheck.Stop();
+        _callWindowsOnTop = settings.Current.CallWindowsOnTop;
+        _recoveryTimer = new DispatcherTimer(DispatcherPriority.Background, owner.Dispatcher);
+        _recoveryTimer.Tick += async (_, _) => await RecoverAsync();
+        _zoomSave = new DispatcherTimer(TimeSpan.FromMilliseconds(800), DispatcherPriority.Background,
+            async (_, _) => await SaveZoomAsync(), owner.Dispatcher);
+        _zoomSave.Stop();
+        System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged += NetworkAvailabilityChanged;
+        SystemEvents.PowerModeChanged += PowerModeChanged;
+        ThemeService.Changed += ApplyTheme;
         foreach (var kind in MediaPermissionPolicy.Kinds)
         {
             _appliedMedia[kind] = MediaPermissionPolicy.Enabled(settings.Current, kind);
@@ -103,14 +124,16 @@ public sealed class WebViewService : IDisposable
         try
         {
             if (_disposed) return;
+            _recoveryTimer.Stop();
+            _pageLoaded = false;
             DisposeView();
             _diagnosticInitialization = diagnosticConfigure is not null;
             NeedsRecovery = false;
             LastFailure = null;
             _memoryApiAvailable = true;
             _memoryTarget = null;
-            _injection = new();
-            StatusChanged?.Invoke("Loading Instagram...", false);
+            RuntimeMissing = false;
+            StatusChanged?.Invoke(Loc.T("Main.Loading"), false);
             Directory.CreateDirectory(AppPaths.UserData);
             string arguments = _settings.Current.HardwareAcceleration ? "" : "--disable-gpu";
             if (_diagnosticInitialization && DiagnosticBrowserArguments is { } diagnosticArguments)
@@ -119,10 +142,12 @@ public sealed class WebViewService : IDisposable
             var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: AppPaths.UserData, options: options)
                 .WaitAsync(TimeSpan.FromSeconds(30));
             if (_disposed) return;
-            View = new WebView2 { DefaultBackgroundColor = System.Drawing.Color.FromArgb(16, 16, 18), ZoomFactor = 1.0 };
+            View = new WebView2 { DefaultBackgroundColor = ThemeService.WebBackground, ZoomFactor = _settings.Current.ZoomFactor };
+            View.ZoomFactorChanged += ViewZoomFactorChanged;
             _host.Children.Add(View);
             await View.EnsureCoreWebView2Async(environment).WaitAsync(TimeSpan.FromSeconds(30));
             if (_disposed) return;
+            _primaryCore = View.CoreWebView2;
             diagnosticConfigure?.Invoke(View.CoreWebView2);
             await ConfigureCoreAsync(View.CoreWebView2);
             // Before the first navigation: the page must never see a stale grant.
@@ -131,7 +156,6 @@ public sealed class WebViewService : IDisposable
             _notifications.DirectInboxMonitoring = MonitorAllowed;
             if (_notifications.DirectInboxMonitoring) _directMonitorCheck.Start();
             await EnsureNotificationPermissionAsync(View.CoreWebView2);
-            await UpdateInjectionAsync();
             SetBackground(_background);
             View.CoreWebView2.Navigate(_pendingNotificationThread ?? NavigationPolicy.Home);
             _pendingNotificationThread = null;
@@ -141,8 +165,8 @@ public sealed class WebViewService : IDisposable
             if (_disposed) return;
             LoggingService.Write(LogEvent.WebViewInitializationError, e);
             bool runtimeMissing = e is WebView2RuntimeNotFoundException;
-            Fail(runtimeMissing ? "Microsoft Edge WebView2 Runtime is required." :
-                "Unable to initialize Instagram. Retry or check the app log.");
+            RuntimeMissing = runtimeMissing;
+            Fail(Loc.T(runtimeMissing ? "Web.RuntimeRequired" : "Web.InitFailed"), retry: !runtimeMissing);
         }
         finally { _operation.Release(); }
     }
@@ -168,7 +192,7 @@ public sealed class WebViewService : IDisposable
         var s = core.Settings;
         s.AreDevToolsEnabled = _settings.Current.DeveloperTools;
         s.IsStatusBarEnabled = false;
-        s.IsZoomControlEnabled = false;
+        s.IsZoomControlEnabled = true;
         // Let Instagram/WebView handle its native keyboard and Emoji input.
         s.AreBrowserAcceleratorKeysEnabled = true;
         s.AreHostObjectsAllowed = false;
@@ -188,15 +212,61 @@ public sealed class WebViewService : IDisposable
         core.SourceChanged += SourceChanged;
         core.WindowCloseRequested += WindowCloseRequested;
         core.HistoryChanged += (_, _) => PublishNavigationState();
+        ZoomChanged?.Invoke(View?.ZoomFactor ?? 1);
         core.ContainsFullScreenElementChanged += (_, _) => FullscreenChanged?.Invoke(core.ContainsFullScreenElement);
-        try { core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Dark; }
-        catch (Exception e) when (e is NotImplementedException or COMException) { }
+        ApplyColorScheme(core);
+        ApplyDownloadFolder(core);
         try { core.NotificationReceived += NotificationReceived; }
         catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
         try { await EmojiFontService.ConfigureAsync(core); }
         catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
+        try { await core.AddScriptToExecuteOnDocumentCreatedAsync(ViewportStyleScript); }
+        catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
         await ConfigureNotificationsAsync(core);
     }
+
+    // Keeps Instagram's original UI while preventing WebView scrollbars from
+    // painting a white gutter over the dark page. Applied before first paint
+    // instead of after every completed load.
+    // Light or dark for Instagram (prefers-color-scheme; Instagram's own
+    // appearance choice still wins) and for what WebView2 paints before it.
+    private void ApplyTheme()
+    {
+        if (_disposed) return;
+        if (View is { } view) view.DefaultBackgroundColor = ThemeService.WebBackground;
+        if (_messagesWindow is { } messages) messages.View.DefaultBackgroundColor = ThemeService.WebBackground;
+        if (Core is { } core && !NeedsRecovery) ApplyColorScheme(core);
+    }
+
+    private static void ApplyColorScheme(CoreWebView2 core)
+    {
+        try
+        {
+            core.Profile.PreferredColorScheme = ThemeService.IsDark
+                ? CoreWebView2PreferredColorScheme.Dark : CoreWebView2PreferredColorScheme.Light;
+        }
+        catch (Exception e) when (e is NotImplementedException or COMException or InvalidOperationException) { }
+    }
+
+    private const string ViewportStyleScript = """
+        (() => {
+          if (window !== window.top || !/(^|\.)instagram\.com$/i.test(location.hostname)) return;
+          const css = 'html,body{overflow-x:clip!important;max-width:100vw!important;}' +
+            '@media (prefers-color-scheme: dark){html,body{background:#000!important;}}' +
+            'html{scrollbar-width:none!important;}' +
+            'html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;}';
+          const add = () => {
+            if (!document.documentElement || document.getElementById('instadesktop-viewport-style')) return;
+            const style = document.createElement('style');
+            style.id = 'instadesktop-viewport-style';
+            style.textContent = css;
+            (document.head || document.documentElement).appendChild(style);
+          };
+          add();
+          document.addEventListener('DOMContentLoaded', add, { once: true });
+          window.addEventListener('load', add, { once: true });
+        })();
+        """;
 
     private async Task ConfigureNotificationsAsync(CoreWebView2 core)
     {
@@ -206,7 +276,8 @@ public sealed class WebViewService : IDisposable
             // behind when the installer preserves user-editable customization.
             string script = "window.__InstaDesktopNotificationsEnabled = " +
                 (_settings.Current.AppNotifications ? "true;\n" : "false;\n") +
-                await ReadNotificationAssetAsync("direct-inbox-dom.js") + "\n" + await ReadNotificationAssetAsync("notifications.js");
+                await ReadNotificationAssetAsync("direct-inbox-dom.js") + "\n" + await ReadNotificationAssetAsync("notifications.js") +
+                "\n" + await ReadNotificationAssetAsync("unread-count.js");
             string next = await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
             if (_notificationScriptId is not null) core.RemoveScriptToExecuteOnDocumentCreated(_notificationScriptId);
             _notificationScriptId = next;
@@ -273,12 +344,23 @@ public sealed class WebViewService : IDisposable
         }
         catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
     }
+    private void SetUnreadCount(int count)
+    {
+        if (UnreadCount == count) return;
+        UnreadCount = count;
+        UnreadCountChanged?.Invoke(count);
+    }
+
     private void NavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
-        if (IsSessionRoute(e.Uri)) StopDirectMonitor();
+        if (IsSessionRoute(e.Uri))
+        {
+            StopDirectMonitor();
+            SetUnreadCount(0); // signing in or out: the old account's count no longer applies
+        }
         if (NavigationPolicy.IsTrusted(e.Uri))
         {
-            _injectionErrorReported = false;
+            _currentNavigationId = e.NavigationId;
             return;
         }
         e.Cancel = true;
@@ -291,46 +373,30 @@ public sealed class WebViewService : IDisposable
         }));
     }
 
-    private async void NavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
+    private void NavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
     {
         if (_disposed) return;
         if (!e.IsSuccess)
         {
             if (e.WebErrorStatus == CoreWebView2WebErrorStatus.OperationCanceled) return;
             LoggingService.Write(LogEvent.NavigationError, code: (int)e.WebErrorStatus);
-            Fail("Instagram could not load. Check your connection and try again.");
+            // A load replaced by a newer one (fast back/forward, notification
+            // click) or stopped by the page ends as ConnectionAborted. The newer
+            // load decides, and an already loaded page stays usable.
+            if (e.NavigationId != _currentNavigationId ||
+                (e.WebErrorStatus == CoreWebView2WebErrorStatus.ConnectionAborted && _pageLoaded)) return;
+            Fail(Loc.T("Web.LoadFailed"));
             return;
         }
         NeedsRecovery = false;
         LastFailure = null;
+        _pageLoaded = true;
+        _recoveryAttempt = 0;
+        _recoveryTimer.Stop();
         if (View is not null) View.Visibility = Visibility.Visible;
         Ready?.Invoke();
         _ = RefreshDirectMonitorAsync();
         PublishNavigationState();
-        // Keep the original Instagram UI while preventing WebView scrollbars
-        // from painting a white gutter over the dark page.
-        if (Core is { } viewportCore && NavigationPolicy.IsTrusted(viewportCore.Source))
-        {
-            try
-            {
-                await viewportCore.ExecuteScriptAsync("(()=>{let s=document.getElementById('instadesktop-viewport-style');if(!s){s=document.createElement('style');s.id='instadesktop-viewport-style';s.textContent='html,body{background:#000!important;overflow-x:clip!important;max-width:100vw!important;}html{scrollbar-width:none!important;}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;}';document.head?.appendChild(s);}else{s.textContent='html,body{background:#000!important;overflow-x:clip!important;max-width:100vw!important;}html{scrollbar-width:none!important;}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;}'}})();");
-            }
-            catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
-        }
-        if (!_settings.Current.UiCustomization && Core is { } cleanCore && NavigationPolicy.IsTrusted(cleanCore.Source))
-        {
-            try { await cleanCore.ExecuteScriptAsync("document.getElementById('instadesktop-custom-style')?.remove(); for (const a of [...document.documentElement.attributes]) if (a.name.startsWith('data-instadesktop')) document.documentElement.removeAttribute(a.name);"); }
-            catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
-        }
-        if (_settings.Current.UiCustomization && Core is { } core && NavigationPolicy.IsTrusted(core.Source))
-        {
-            try
-            {
-                string result = await core.ExecuteScriptAsync("Boolean(window.__InstaDesktopCustomization?.version === 1)");
-                if (result != "true") ReportInjectionError();
-            }
-            catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
-        }
     }
 
     private void NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
@@ -346,9 +412,11 @@ public sealed class WebViewService : IDisposable
             return;
         }
         e.Handled = true;
+        bool fromPopout = sender is CoreWebView2 source && source != Core;
         _owner.Dispatcher.BeginInvoke(new Action(() =>
         {
             if (_disposed) return;
+            if (fromPopout && (NavigationPolicy.IsTrusted(uri) || NavigationPolicy.UpgradeInstagramHttp(uri) is not null)) ShowRequested?.Invoke();
             if (NavigationPolicy.IsTrusted(uri)) Core?.Navigate(uri);
             else if (NavigationPolicy.UpgradeInstagramHttp(uri) is { } https) Core?.Navigate(https);
             else ShellService.OpenWeb(uri);
@@ -387,7 +455,7 @@ public sealed class WebViewService : IDisposable
             try
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(WebViewService));
-                window = new CallWindow(width, height, _owner);
+                window = new CallWindow(width, height, _owner, _settings.Current.CallWindowsOnTop);
                 window.Show();
                 await window.View.EnsureCoreWebView2Async(environment).WaitAsync(TimeSpan.FromSeconds(20));
                 if (_disposed) throw new ObjectDisposedException(nameof(WebViewService));
@@ -406,7 +474,7 @@ public sealed class WebViewService : IDisposable
                 try { e.Handled = true; }
                 catch (Exception) { }
                 if (window is not null) { _callWindows.Remove(window); window.Close(); }
-                if (!_disposed) UserNotice?.Invoke("The Instagram call window could not open.\nTry again, or restart InstaDesktop.");
+                if (!_disposed) UserNotice?.Invoke(Loc.T("Web.CallWindowFailed"));
             }
             finally
             {
@@ -416,12 +484,15 @@ public sealed class WebViewService : IDisposable
         }));
     }
 
-    private void ConfigureCallCore(CoreWebView2 core, CallWindow window)
+    // Shared by call windows and the messages window: same permission flow,
+    // downloads and pop-up handling as the main page; the main page owns
+    // notifications. Window-specific cleanup is registered by the caller.
+    private void ConfigurePopoutCore(CoreWebView2 core, PopoutWindow window, bool call)
     {
         var s = core.Settings;
         s.AreDevToolsEnabled = _settings.Current.DeveloperTools;
         s.IsStatusBarEnabled = false;
-        s.IsZoomControlEnabled = false;
+        s.IsZoomControlEnabled = !call;
         s.AreHostObjectsAllowed = false;
         s.AreBrowserAcceleratorKeysEnabled = true;
         s.AreDefaultContextMenusEnabled = true;
@@ -443,10 +514,13 @@ public sealed class WebViewService : IDisposable
                 else ShellService.OpenWeb(target);
             }));
         };
-        core.DocumentTitleChanged += (_, _) =>
-            window.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? "Instagram call" : core.DocumentTitle;
+        // A call window shows the call page's title; the messages panel keeps its own.
+        string fallbackTitle = window.Title;
+        if (call)
+            core.DocumentTitleChanged += (_, _) =>
+                window.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? fallbackTitle : core.DocumentTitle;
         core.ContainsFullScreenElementChanged += (_, _) => window.SetFullscreen(core.ContainsFullScreenElement);
-        // The call page ending itself closes only its own window.
+        // The page ending itself (a call hanging up) closes only its own window.
         core.WindowCloseRequested += (_, _) =>
         {
             LoggingService.Write(LogEvent.WindowCloseRequested, code: 10 + PathCategory(core.Source));
@@ -455,23 +529,152 @@ public sealed class WebViewService : IDisposable
         core.ProcessFailed += (_, e) =>
         {
             LoggingService.Write(LogEvent.WebViewProcessError, code: 2000 + (int)e.ProcessFailedKind);
-            if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
-                CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+            void ClosePopout()
             {
+                if (!_documentEpochs.ContainsKey(core)) return; // already closed
                 CancelPendingPermissions(core, null, MediaPermissionPolicy.Reason.Canceled);
-                _owner.Dispatcher.BeginInvoke(new Action(window.Close));
+                _owner.Dispatcher.BeginInvoke(new Action(window.CloseForGood));
             }
+            if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+                _ = ReplaceIfStillUnresponsiveAsync(core, ClosePopout);
+            else if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
+                CoreWebView2ProcessFailedKind.RenderProcessExited)
+                ClosePopout();
         };
         window.Closed += (_, _) =>
         {
             CancelPendingPermissions(core, null, MediaPermissionPolicy.Reason.Canceled);
             _documentEpochs.Remove(core);
-            _callWindows.Remove(window);
             try { window.View.Dispose(); }
-            catch (Exception error) { LoggingService.Write(LogEvent.CallWindowFailed, error); }
+            catch (Exception error) { LoggingService.Write(call ? LogEvent.CallWindowFailed : LogEvent.MessagesWindowFailed, error); }
+        };
+    }
+
+    private void ConfigureCallCore(CoreWebView2 core, CallWindow window)
+    {
+        ConfigurePopoutCore(core, window, call: true);
+        window.Closed += (_, _) =>
+        {
+            _callWindows.Remove(window);
             LoggingService.Write(LogEvent.CallWindowClosed, code: _callWindows.Count);
             SetBackground(_background);
         };
+    }
+
+    // ---- Messages window ----------------------------------------------------
+
+    private MessagesWindow? _messagesWindow;
+    internal MessagesWindow? MessagesWindow => _messagesWindow;
+
+    // A hidden panel keeps its page for an instant return, but not forever.
+    internal static TimeSpan MessagesIdleClose { get; set; } = TimeSpan.FromMinutes(10);
+    private DispatcherTimer? _messagesIdle;
+
+    // Title bar button, Ctrl+Shift+M and the tray: hide the panel when it is
+    // in front, otherwise show it.
+    public async Task<bool> ToggleMessagesWindowAsync()
+    {
+        if (_messagesWindow is { IsVisible: true, IsActive: true } shown)
+        {
+            shown.Close(); // hides
+            return true;
+        }
+        return await OpenMessagesWindowAsync();
+    }
+
+    // Opens (or brings back) the floating inbox panel. Needs the main page's
+    // environment, so it waits until Instagram has started once.
+    public async Task<bool> OpenMessagesWindowAsync()
+    {
+        if (_disposed) return false;
+        if (_messagesWindow is { } open)
+        {
+            _messagesIdle?.Stop();
+            if (open.WindowState == WindowState.Minimized) open.WindowState = WindowState.Normal;
+            open.Show();
+            open.Activate();
+            open.View.Focus();
+            return true;
+        }
+        if (Core is not { } primary || NeedsRecovery)
+        {
+            UserNotice?.Invoke(Loc.T("Web.MessagesNotReady"));
+            return false;
+        }
+        var s = _settings.Current;
+        var window = new MessagesWindow(s.MessagesWidth, s.MessagesHeight, s.MessagesLeft, s.MessagesTop, _owner);
+        _messagesWindow = window;
+        Action<int> unread = window.SetUnread;
+        window.SetUnread(UnreadCount);
+        UnreadCountChanged += unread;
+        window.OpenInMainRequested += () => OpenMessagesInMain(window);
+        window.Hidden += () =>
+        {
+            _ = SaveMessagesBoundsAsync(window);
+            _messagesIdle ??= new DispatcherTimer(MessagesIdleClose, DispatcherPriority.Background, (_, _) =>
+            {
+                _messagesIdle?.Stop();
+                if (_messagesWindow is { IsVisible: false } idle) idle.CloseForGood();
+            }, _owner.Dispatcher);
+            _messagesIdle.Interval = MessagesIdleClose;
+            _messagesIdle.Stop();
+            _messagesIdle.Start();
+        };
+        window.Closed += async (_, _) =>
+        {
+            UnreadCountChanged -= unread;
+            _messagesIdle?.Stop();
+            if (_messagesWindow == window) _messagesWindow = null;
+            LoggingService.Write(LogEvent.MessagesWindowClosed);
+            SetBackground(_background);
+            await SaveMessagesBoundsAsync(window);
+        };
+        try
+        {
+            window.Show();
+            await window.View.EnsureCoreWebView2Async(primary.Environment).WaitAsync(TimeSpan.FromSeconds(20));
+            if (_disposed || _messagesWindow != window) { window.Close(); return false; }
+            var core = window.View.CoreWebView2;
+            ConfigurePopoutCore(core, window, call: false);
+            try { await EmojiFontService.ConfigureAsync(core); }
+            catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(ViewportStyleScript);
+            core.Navigate(DirectInboxMonitor.InboxUrl);
+            SetBackground(_background);
+            LoggingService.Write(LogEvent.MessagesWindowOpened);
+            return true;
+        }
+        catch (Exception error)
+        {
+            LoggingService.Write(LogEvent.MessagesWindowFailed, error);
+            window.Close();
+            return false;
+        }
+    }
+
+    private async Task SaveMessagesBoundsAsync(MessagesWindow window)
+    {
+        var bounds = window.WindowState == WindowState.Normal ? new Rect(window.Left, window.Top, window.Width, window.Height) : window.RestoreBounds;
+        if (_disposed || bounds.IsEmpty || !double.IsFinite(bounds.Left)) return;
+        try
+        {
+            await _settings.UpdateAsync(x =>
+            {
+                x.MessagesLeft = bounds.Left; x.MessagesTop = bounds.Top;
+                x.MessagesWidth = bounds.Width; x.MessagesHeight = bounds.Height;
+            });
+        }
+        catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
+    }
+
+    // The panel's "open in main window": the same conversation, full size.
+    private void OpenMessagesInMain(MessagesWindow window)
+    {
+        string? source = window.View.CoreWebView2?.Source;
+        string target = NavigationPolicy.IsTrusted(source) ? source! : DirectInboxMonitor.InboxUrl;
+        ShowRequested?.Invoke();
+        if (Core is { } core && !NeedsRecovery) core.Navigate(target);
+        window.Close(); // hides
     }
 
     private void PermissionRequested(object? sender, CoreWebView2PermissionRequestedEventArgs e)
@@ -630,7 +833,7 @@ public sealed class WebViewService : IDisposable
                 if (kinds.Count > 0)
                 {
                     // Ask over the window that asked: a call window, or the main window.
-                    Window owner = _callWindows.FirstOrDefault(w => w.View.CoreWebView2 == first.Core) ?? _owner;
+                    Window owner = Popouts.FirstOrDefault(w => w.View.CoreWebView2 == first.Core) ?? _owner;
                     if (owner == _owner) ShowRequested?.Invoke();
                     else owner.Activate();
                     LoggingService.Write(LogEvent.MediaPermissionPrompt, code: kinds.Sum(k => 1 << (int)k));
@@ -661,22 +864,38 @@ public sealed class WebViewService : IDisposable
     {
         string host = Uri.TryCreate(uri, UriKind.Absolute, out var parsed) ? parsed.Host : "Instagram";
         if (DiagnosticPermissionPrompt is { } prompt) return await prompt(kinds, host);
-        string names = string.Join(" and ", kinds.Select(kind => kind switch
+        string names = string.Join(Loc.T("Web.PermissionAnd"), kinds.Select(kind => kind switch
         {
-            CoreWebView2PermissionKind.Microphone => "microphone",
-            CoreWebView2PermissionKind.Camera => "camera",
-            CoreWebView2PermissionKind.Notifications => "notifications",
+            CoreWebView2PermissionKind.Microphone => Loc.T("Web.PermissionMicrophone"),
+            CoreWebView2PermissionKind.Camera => Loc.T("Web.PermissionCamera"),
+            CoreWebView2PermissionKind.Notifications => Loc.T("Web.PermissionNotifications"),
             _ => kind.ToString()
         }));
-        string detail = kinds.Any(MediaPermissionPolicy.IsMediaKind)
-            ? "\n\nInstaDesktop remembers your answer. To be asked again, turn the setting off and on in Settings, or use Reset website permissions."
-            : "\n\nYou can reset website permissions in Settings.";
-        return MessageBox.Show(owner, $"Allow {host} to use your {names}?{detail}",
-            "Instagram permission", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) == MessageBoxResult.Yes;
+        string detail = Loc.T(kinds.Any(MediaPermissionPolicy.IsMediaKind) ? "Web.PermissionRemember" : "Web.PermissionResetHint");
+        return MessageBox.Show(owner, Loc.F("Web.PermissionQuestion", host, names) + Environment.NewLine + Environment.NewLine + detail,
+            Loc.T("Web.PermissionTitle"), MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) == MessageBoxResult.Yes;
+    }
+
+    public string DownloadFolder => _settings.Current.DownloadFolder ?? ShellService.DownloadsFolder;
+
+    // Profile-wide, so call windows (same profile) save to the same place.
+    private void ApplyDownloadFolder(CoreWebView2 core)
+    {
+        try
+        {
+            Directory.CreateDirectory(DownloadFolder);
+            core.Profile.DefaultDownloadFolderPath = DownloadFolder;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or COMException or NotImplementedException)
+        { LoggingService.Write(LogEvent.DownloadFolderUnavailable, error); }
     }
 
     private void DownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
     {
+        LoggingService.Write(LogEvent.DownloadStarted, code: _settings.Current.AskDownloadLocation ? 1 : 0);
+        // Saved straight to the download folder: WebView2 names the file and
+        // shows its own progress list; nothing else to decide here.
+        if (!_settings.Current.AskDownloadLocation) return;
         var deferral = e.GetDeferral();
         _owner.Dispatcher.BeginInvoke(new Action(() =>
         {
@@ -686,9 +905,10 @@ public sealed class WebViewService : IDisposable
                 ShowRequested?.Invoke();
                 var dialog = new SaveFileDialog
                 {
-                    Title = "Save Instagram download",
+                    Title = Loc.T("Web.SaveDownload"),
+                    InitialDirectory = Path.GetDirectoryName(e.ResultFilePath),
                     FileName = Path.GetFileName(e.ResultFilePath),
-                    Filter = "All files (*.*)|*.*",
+                    Filter = Loc.T("Web.AllFiles"),
                     OverwritePrompt = true
                 };
                 if (dialog.ShowDialog(_owner) == true) e.ResultFilePath = dialog.FileName;
@@ -724,15 +944,49 @@ public sealed class WebViewService : IDisposable
     private void ProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e)
     {
         LoggingService.Write(LogEvent.WebViewProcessError, code: (int)e.ProcessFailedKind);
-        if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
-            CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+        if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessUnresponsive && sender is CoreWebView2 hung)
         {
-            if (sender is CoreWebView2 failed) CancelPendingPermissions(failed, null, MediaPermissionPolicy.Reason.Canceled);
-            // The page that owned these native notifications is gone.
-            if (sender is not null) _notifications.ReleaseNative(sender);
-            Fail("Instagram renderer crashed.");
+            _ = ReplaceIfStillUnresponsiveAsync(hung, () =>
+            {
+                if (_disposed || Core != hung || NeedsRecovery) return;
+                LosePrimary(hung, Loc.T("Web.Unresponsive"));
+            });
+            return;
         }
+        if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited or
+            CoreWebView2ProcessFailedKind.RenderProcessExited)
+            LosePrimary(sender, Loc.T("Web.Crashed"));
         // WebView2 automatically recovers ancillary GPU/utility processes.
+    }
+
+    private void LosePrimary(object? failed, string message)
+    {
+        if (failed is CoreWebView2 core) CancelPendingPermissions(core, null, MediaPermissionPolicy.Reason.Canceled);
+        // The page that owned these native notifications is gone.
+        if (failed is not null) _notifications.ReleaseNative(failed);
+        Fail(message);
+    }
+
+    // "Unresponsive" is reported for a page that is only busy for a while
+    // (large feed, video decode). Replacing it at once loses the page, or ends
+    // a call; replace it only if it still cannot run a script after a grace period.
+    internal static TimeSpan UnresponsiveGrace { get; set; } = TimeSpan.FromSeconds(20);
+    private readonly HashSet<CoreWebView2> _probingUnresponsive = new();
+
+    internal async Task ReplaceIfStillUnresponsiveAsync(CoreWebView2 core, Action replace)
+    {
+        if (!_probingUnresponsive.Add(core)) return;
+        bool responsive;
+        try
+        {
+            await core.ExecuteScriptAsync("0").WaitAsync(UnresponsiveGrace);
+            responsive = true;
+        }
+        catch (Exception error) when (error is TimeoutException or COMException or InvalidOperationException or ObjectDisposedException)
+        { responsive = false; }
+        finally { _probingUnresponsive.Remove(core); }
+        LoggingService.Write(LogEvent.RendererUnresponsive, code: responsive ? 0 : 1);
+        if (!responsive) replace();
     }
 
     private void WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -754,13 +1008,16 @@ public sealed class WebViewService : IDisposable
             }
             using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 8 });
             var root = document.RootElement;
-            if (root.ValueKind == JsonValueKind.String)
-            {
-                if (_settings.Current.UiCustomization && root.GetString() == "instadesktop:injection-error") ReportInjectionError();
-                return;
-            }
             if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String) return;
             if (type.GetString() == "instadesktop:notification") { LoggingService.Write(LogEvent.NotificationRejected); return; }
+            if (type.GetString() == "instadesktop:unread")
+            {
+                // null: the Messages link is not on screen; keep the last count.
+                if (sender == Core && root.TryGetProperty("count", out var unread) &&
+                    unread.TryGetInt32(out int unreadCount) && unreadCount is >= 0 and <= 9999)
+                    SetUnreadCount(unreadCount);
+                return;
+            }
             if (type.GetString() == "instadesktop:notification-diagnostic")
             {
                 if (!_settings.Current.AppNotifications || !NotificationPolicy.IsInstagramOrigin(e.Source)) return;
@@ -775,31 +1032,8 @@ public sealed class WebViewService : IDisposable
                 }
                 return;
             }
-            if (!_settings.Current.UiCustomization || json.Length > 4096) return;
-            if (type.GetString() is "routeChanged" or "pageLoaded")
-            {
-                // Page messages only request a refresh. Core.Source remains authoritative.
-                PublishNavigationState();
-            }
-            else if (type.GetString() == "actionResult" && root.TryGetProperty("action", out var action) &&
-                action.ValueKind == JsonValueKind.String && Enum.TryParse<NavigationSection>(action.GetString(), true, out var section) &&
-                section is NavigationSection.Search or NavigationSection.Notifications or NavigationSection.Profile or NavigationSection.Create)
-            {
-                if (root.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.True)
-                    RouteChanged?.Invoke(section);
-                if (root.TryGetProperty("fallback", out var fallback) && fallback.ValueKind == JsonValueKind.True)
-                    UserNotice?.Invoke("Instagram's original navigation is visible for this panel. Use the toolbar menu to return to the desktop layout.");
-            }
         }
         catch (Exception error) when (error is ArgumentException or JsonException or InvalidOperationException) { }
-    }
-
-    private void ReportInjectionError()
-    {
-        if (_injectionErrorReported) return;
-        _injectionErrorReported = true;
-        LoggingService.Write(LogEvent.InjectionError);
-        InjectionFailed?.Invoke();
     }
 
     private async void SourceChanged(object? sender, CoreWebView2SourceChangedEventArgs e)
@@ -837,7 +1071,7 @@ public sealed class WebViewService : IDisposable
         // Low target may discard renderer resources. Keep normal memory while
         // notifications are enabled; never suspend the WebView for tray mode.
         // A call window shares the opener's renderer; keep it at Normal during calls.
-        var target = background && _settings.Current.BackgroundLowMemory && !_settings.Current.AppNotifications && _callWindows.Count == 0
+        var target = background && _settings.Current.BackgroundLowMemory && !_settings.Current.AppNotifications && _callWindows.Count == 0 && _messagesWindow is null
             ? CoreWebView2MemoryUsageTargetLevel.Low : CoreWebView2MemoryUsageTargetLevel.Normal;
         if (_memoryTarget == target) return;
         try
@@ -865,38 +1099,24 @@ public sealed class WebViewService : IDisposable
         try
         {
             if (_disposed || Core is null) return;
-            await UpdateInjectionAsync();
             Core.Reload();
         }
         catch (Exception e)
         {
             LoggingService.Write(LogEvent.NavigationError, e);
-            Fail("Instagram could not reload. Try again.");
+            Fail(Loc.T("Web.ReloadFailed"));
         }
         finally { _operation.Release(); }
     }
 
-    private async Task UpdateInjectionAsync()
+    public async Task ApplySettingsAsync()
     {
-        if (Core is null) return;
-        if (!_settings.Current.UiCustomization)
+        // Only a changed switch overrides what was chosen in a call window's menu.
+        if (_callWindowsOnTop != _settings.Current.CallWindowsOnTop)
         {
-            // Remove customization injected by an earlier build/profile so the
-            // original Instagram layout cannot retain a blank navigation gutter.
-            try { await Core.ExecuteScriptAsync("document.getElementById('instadesktop-custom-style')?.remove(); for (const a of [...document.documentElement.attributes]) if (a.name.startsWith('data-instadesktop')) document.documentElement.removeAttribute(a.name);"); }
-            catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
-            return;
+            _callWindowsOnTop = _settings.Current.CallWindowsOnTop;
+            foreach (var call in _callWindows) call.SetOnTop(_callWindowsOnTop);
         }
-        try { await _injection.ConfigureAsync(Core, _settings.Current.UiCustomization, _settings.Current.CompactInstagramLayout); }
-        catch (Exception e)
-        {
-            LoggingService.Write(LogEvent.InjectionError, e);
-            InjectionFailed?.Invoke();
-        }
-    }
-
-    public async Task ApplySettingsAsync(bool customizationChanged)
-    {
         UpdateMediaSwitches();
         _notifications.DirectInboxMonitoring = MonitorAllowed;
         if (!_notifications.DirectInboxMonitoring) { _directMonitorCheck.Stop(); StopDirectMonitor(); }
@@ -904,18 +1124,12 @@ public sealed class WebViewService : IDisposable
         if (Core is not { } core) return;
         await SyncMediaPermissionsAsync(core, startup: false);
         core.Settings.AreDevToolsEnabled = _settings.Current.DeveloperTools;
+        ApplyDownloadFolder(core);
         if (!_settings.Current.AppNotifications) _notifications.Reset(removeNotifications: true);
         await EnsureNotificationPermissionAsync(core);
         await ConfigureNotificationsAsync(core);
         _ = RefreshDirectMonitorAsync();
         SetBackground(_background);
-        if (customizationChanged) await ReloadCustomizationAsync();
-        else if (_settings.Current.UiCustomization)
-        {
-            await _injection.ConfigureAsync(core, true, _settings.Current.CompactInstagramLayout);
-            if (NavigationPolicy.IsTrusted(core.Source))
-                await core.ExecuteScriptAsync("window.__InstaDesktopCustomization?.setCompact(" + (_settings.Current.CompactInstagramLayout ? "true" : "false") + ");");
-        }
     }
 
     public async Task<PermissionResetResult> ResetPermissionsAsync()
@@ -994,14 +1208,34 @@ public sealed class WebViewService : IDisposable
             }
             if (migrate && !_disposed)
             {
-                var next = _settings.Current.Copy();
-                next.MediaPermissionRevision = 1;
-                await _settings.SaveAsync(next);
+                await _settings.UpdateAsync(s => s.MediaPermissionRevision = 1);
                 LoggingService.Write(LogEvent.MediaPermissionMigrated, code: 1);
             }
         }
         catch (Exception error) { LoggingService.Write(LogEvent.MediaPermissionSync, error); }
         finally { _mediaSync.Release(); }
+    }
+
+    // Settings > Clear cache: cached files and service workers only. Cookies,
+    // site storage and permissions stay, so the user remains signed in.
+    // null = Instagram is not loaded yet.
+    public async Task<bool?> ClearCacheAsync()
+    {
+        if (_disposed || NeedsRecovery || Core is not { } core) return null;
+        try
+        {
+            await core.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.DiskCache |
+                CoreWebView2BrowsingDataKinds.CacheStorage | CoreWebView2BrowsingDataKinds.ServiceWorkers);
+            LoggingService.Write(LogEvent.CacheCleared);
+            core.Reload();
+            _messagesWindow?.View.CoreWebView2?.Reload();
+            return true;
+        }
+        catch (Exception error) when (error is COMException or NotImplementedException or InvalidOperationException)
+        {
+            LoggingService.Write(LogEvent.CacheCleared, error);
+            return false;
+        }
     }
 
     // Combined Instagram site state for Settings; null when the profile is unavailable.
@@ -1012,14 +1246,100 @@ public sealed class WebViewService : IDisposable
         catch (Exception error) { LoggingService.Write(LogEvent.MediaPermissionSync, error); return null; }
     }
 
-    private void Fail(string message)
+    private void Fail(string message, bool retry = true)
     {
         NeedsRecovery = true;
         FullscreenChanged?.Invoke(false);
-        HistoryChanged?.Invoke(false, false);
         LastFailure = message;
         if (View is not null) View.Visibility = Visibility.Hidden;
-        StatusChanged?.Invoke(message, true);
+        _canAutoRecover = retry && !_diagnosticInitialization;
+        if (_canAutoRecover) ScheduleRecovery(RecoveryDelays[Math.Min(_recoveryAttempt, RecoveryDelays.Length - 1)]);
+        StatusChanged?.Invoke(_canAutoRecover ? message + " " + Loc.T("Web.Retrying") : message, true);
+    }
+
+    // A failed load or crashed renderer recovers by itself (backoff, network
+    // return, resume from sleep). Without this, a tray-only session started
+    // before the network was ready never loads and never notifies.
+    private static readonly TimeSpan[] RecoveryDelays =
+    {
+        TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30),
+        TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(5)
+    };
+
+    private void ScheduleRecovery(TimeSpan delay)
+    {
+        if (_disposed || !NeedsRecovery || !_canAutoRecover) return;
+        _recoveryTimer.Stop();
+        _recoveryTimer.Interval = delay;
+        _recoveryTimer.Start();
+    }
+
+    private async Task RecoverAsync()
+    {
+        _recoveryTimer.Stop();
+        if (_disposed || !NeedsRecovery || !_canAutoRecover) return;
+        // A manual Retry or another rebuild is already running; check again later.
+        if (_operation.CurrentCount == 0) { ScheduleRecovery(RecoveryDelays[0]); return; }
+        _recoveryAttempt++;
+        LoggingService.Write(LogEvent.AutoRecoveryAttempt, code: _recoveryAttempt);
+        await InitializeAsync();
+    }
+
+    private void NetworkAvailabilityChanged(object? sender, System.Net.NetworkInformation.NetworkAvailabilityEventArgs e)
+    {
+        if (e.IsAvailable) _owner.Dispatcher.BeginInvoke(new Action(OnNetworkAvailable));
+    }
+
+    // Also the diagnostic entry point: Windows reporting a network again.
+    internal void OnNetworkAvailable() => ScheduleRecovery(TimeSpan.FromSeconds(3));
+
+    private void PowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume) _owner.Dispatcher.BeginInvoke(new Action(() => ScheduleRecovery(TimeSpan.FromSeconds(5))));
+    }
+
+    // Zoom: Ctrl+wheel (WebView2) and the window shortcuts share one factor,
+    // saved shortly after it stops changing.
+    private static readonly double[] ZoomLevels = { 0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5 };
+    public double ZoomFactor => View?.ZoomFactor ?? _settings.Current.ZoomFactor;
+
+    public void StepZoom(int direction)
+    {
+        if (View is not { } view || NeedsRecovery) return;
+        double current = view.ZoomFactor;
+        view.ZoomFactor = direction > 0
+            ? ZoomLevels.FirstOrDefault(level => level > current + 0.001, ZoomLevels[^1])
+            : ZoomLevels.LastOrDefault(level => level < current - 0.001, ZoomLevels[0]);
+        ZoomUpdated();
+    }
+
+    public void ResetZoom()
+    {
+        if (View is not { } view || NeedsRecovery) return;
+        view.ZoomFactor = 1;
+        ZoomUpdated();
+    }
+
+    // Ctrl+wheel arrives here; shortcuts also report directly so the indicator
+    // never depends on the event timing.
+    private void ViewZoomFactorChanged(object? sender, EventArgs e) => ZoomUpdated();
+
+    private void ZoomUpdated()
+    {
+        if (View is not { } view) return;
+        ZoomChanged?.Invoke(view.ZoomFactor);
+        _zoomSave.Stop();
+        _zoomSave.Start();
+    }
+
+    private async Task SaveZoomAsync()
+    {
+        _zoomSave.Stop();
+        if (View is not { } view) return;
+        double factor = Math.Round(view.ZoomFactor, 3);
+        if (Math.Abs(factor - _settings.Current.ZoomFactor) < 0.001) return;
+        try { await _settings.UpdateAsync(s => s.ZoomFactor = factor); }
+        catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
     }
 
     private void DisposeView()
@@ -1030,11 +1350,12 @@ public sealed class WebViewService : IDisposable
         _notificationScriptId = null;
         // Complete deferrals while their WebView is still alive. Call windows
         // are independent views and keep running across a main-page rebuild.
-        if (View?.CoreWebView2 is { } primary)
+        if (_primaryCore is { } primary)
         {
             CancelPendingPermissions(primary, null, MediaPermissionPolicy.Reason.Canceled);
             _documentEpochs.Remove(primary);
         }
+        _primaryCore = null;
         if (View is null) return;
         View.Dispose();
         _host.Children.Remove(View);
@@ -1082,8 +1403,18 @@ public sealed class WebViewService : IDisposable
 
     public void Dispose()
     {
+        if (!_disposed)
+        {
+            System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged -= NetworkAvailabilityChanged;
+            SystemEvents.PowerModeChanged -= PowerModeChanged;
+            if (_zoomSave.IsEnabled) _ = SaveZoomAsync();
+        }
         _disposed = true;
+        _recoveryTimer.Stop();
         foreach (var window in _callWindows.ToArray()) window.Close();
+        _messagesIdle?.Stop();
+        _messagesWindow?.CloseForGood();
+        ThemeService.Changed -= ApplyTheme;
         DisposeView();
     }
 
@@ -1103,45 +1434,15 @@ public sealed class WebViewService : IDisposable
 
     private void PublishNavigationState()
     {
-        if (NeedsRecovery || Core is not { } core) return;
-        HistoryChanged?.Invoke(core.CanGoBack, core.CanGoForward);
-        if (!NavigationPolicy.IsTrusted(core.Source)) return;
+        if (NeedsRecovery || Core is not { } core || !NavigationPolicy.IsTrusted(core.Source)) return;
         CurrentSection = InstagramRoutes.FromPath(new Uri(core.Source).AbsolutePath);
-        RouteChanged?.Invoke(CurrentSection);
     }
 
     public async Task NavigateSectionAsync(NavigationSection section)
     {
+        if (InstagramRoutes.PathFor(section) is not { } path) return;
         if (Core is null || NeedsRecovery) await InitializeAsync();
         if (Core is not { } core || NeedsRecovery) return;
-        if (InstagramRoutes.PathFor(section) is { } path) { core.Navigate("https://www.instagram.com" + path); return; }
-        if (!NavigationPolicy.IsTrusted(core.Source)) return;
-        string action = JsonSerializer.Serialize(section.ToString().ToLowerInvariant());
-        string result = await core.ExecuteScriptAsync("Boolean(window.__InstaDesktopCustomization?.invokeAction(" + action + "))");
-        if (result != "true")
-        {
-            await RevealWebNavigationAsync(true);
-            UserNotice?.Invoke($"{section} could not be opened automatically. Sign in if needed, then use Instagram's original navigation in the content area.");
-            PublishNavigationState();
-        }
-    }
-
-    public async Task ReloadCustomizationAsync()
-    {
-        await _operation.WaitAsync();
-        try
-        {
-            if (_disposed || NeedsRecovery || Core is not { } core) return;
-            await _injection.RefreshAsync(core, _settings.Current.UiCustomization, _settings.Current.CompactInstagramLayout);
-        }
-        catch (Exception e) { LoggingService.Write(LogEvent.InjectionError, e); InjectionFailed?.Invoke(); }
-        finally { _operation.Release(); }
-    }
-
-    public async Task RevealWebNavigationAsync(bool? show = null)
-    {
-        if (Core is not { } core || NeedsRecovery || !NavigationPolicy.IsTrusted(core.Source)) return;
-        string argument = show.HasValue ? (show.Value ? "true" : "false") : "undefined";
-        await core.ExecuteScriptAsync("window.__InstaDesktopCustomization?.revealNavigation(" + argument + ");");
+        core.Navigate("https://www.instagram.com" + path);
     }
 }

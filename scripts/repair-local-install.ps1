@@ -4,7 +4,7 @@ Updates an existing local installation from a verified, self-contained publish.
 .DESCRIPTION
 Pass the actual user's installation and existing Start Menu shortcut explicitly.
 Does not read or change settings, WebView profiles, or notification preferences.
-Existing Assets files are retained. Changed files and the shortcut are backed up
+Changed files and the shortcut are backed up
 under artifacts/install-backups before deployment. Copy/verification failures
 restore those backups and remove only individual files added by this operation.
 Run the publish verification scripts first. -WhatIf performs read-only planning.
@@ -83,16 +83,11 @@ $shortcut = $shell.CreateShortcut($shortcutFile)
 $shortcutBefore = [ordered]@{ targetPath = $shortcut.TargetPath; workingDirectory = $shortcut.WorkingDirectory }
 $shortcutNeedsRepair = $shortcut.TargetPath -ne $installedExe -or $shortcut.WorkingDirectory -ne $installRoot
 $files = @()
-$preservedAssets = 0
 foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force) {
     $relative = $file.FullName.Substring($sourceRoot.Length + 1)
     $destination = Get-ChildPath $installRoot $relative
     if (Test-Path -LiteralPath $destination -PathType Container) { throw "File destination is a directory: $destination" }
     $exists = Test-Path -LiteralPath $destination -PathType Leaf
-    if ($exists -and $relative.StartsWith('Assets\', [StringComparison]::OrdinalIgnoreCase)) {
-        $preservedAssets++
-        continue
-    }
     $newHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
     $oldHash = if ($exists) { (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash } else { $null }
     if ($newHash -eq $oldHash) { continue }
@@ -102,8 +97,8 @@ foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force) 
     }
 }
 $running = @(Get-Process -Name InstaDesktop -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installedExe })
-Write-Output ("Plan: {0} changed/new files; {1} existing Assets files preserved; shortcut repair: {2}; matching running processes: {3}." -f
-    $files.Count, $preservedAssets, $shortcutNeedsRepair, $running.Count)
+Write-Output ("Plan: {0} changed/new files; shortcut repair: {1}; matching running processes: {2}." -f
+    $files.Count, $shortcutNeedsRepair, $running.Count)
 if (-not $PSCmdlet.ShouldProcess($installRoot, "Repair from $sourceRoot and update existing shortcut $shortcutFile")) { return }
 
 $backupRoot = Join-Path $projectRoot ('artifacts\install-backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -114,7 +109,7 @@ $manifest = [ordered]@{
     startedAt = [DateTimeOffset]::Now.ToString('o'); status = 'backing-up'; publishDirectory = $sourceRoot
     installDirectory = $installRoot; shortcutPath = $shortcutFile; shortcutBefore = $shortcutBefore
     shortcutChanged = $shortcutNeedsRepair; shortcutBackup = $null; files = $files
-    preservedAssets = $preservedAssets; stoppedProcessIds = @(); restartedProcessId = $null
+    stoppedProcessIds = @(); restartedProcessId = $null
     requiredFiles = $requiredFiles; verifiedHashes = @(); failure = $null; rollbackErrors = @()
 }
 function Save-Manifest { $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8 }

@@ -24,6 +24,13 @@ internal static class UpdateTests
 
     internal static void Run(Action<bool, string> check)
     {
+        var current = new Version(1, 2, 2);
+        check(UpdateController.UpdatedNotice("1.2.1", current) == current, "update notice: shown after an upgrade");
+        check(UpdateController.UpdatedNotice(null, current) is null, "update notice: not shown on a first install");
+        check(UpdateController.UpdatedNotice("1.2.2", current) is null && UpdateController.UpdatedNotice("1.3.0", current) is null &&
+            UpdateController.UpdatedNotice("not a version", current) is null, "update notice: not shown for the same, older or unknown version");
+        check(AutoUpdateService.ReleasePage(new Version(1, 2, 2)) == "https://github.com/kurtxtb/InstaDesktop/releases/tag/v1.2.2",
+            "update notice: links the release page");
         var info = AutoUpdateService.Parse(Release("v1.1.0"), requireGitHubHost: true);
         check(info is not null && info.Version == new Version(1, 1, 0) && info.Sha256 == Hash &&
             info.InstallerUri.AbsoluteUri == "https://github.com/kurtxtb/InstaDesktop/releases/download/v1.1.0/InstaDesktop-Setup.exe",

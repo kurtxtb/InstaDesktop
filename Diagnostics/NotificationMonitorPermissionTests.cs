@@ -172,6 +172,14 @@ internal static class NotificationMonitorPermissionTests
                 "real presenter logs enabled setting and submission");
             check(notifier.Shown[0].Tag == "0123456789abcdef" && notifier.Shown[0].Group == "instagram" && !notifier.Shown[0].SuppressPopup,
                 "real presenter builds a popup toast with the delivery token");
+            string conversationXml = notifier.Shown[0].Content.GetXml();
+            check(conversationXml.Contains("<action", StringComparison.Ordinal) && conversationXml.Contains("action=mute", StringComparison.Ordinal) &&
+                conversationXml.Contains("activationType=\"background\"", StringComparison.Ordinal),
+                "a conversation's toast offers Mute without opening the window");
+            presenter.Show(sample with { ThreadUrl = null }, "0123456789abcdee", null, null, false);
+            check(!notifier.Shown[^1].Content.GetXml().Contains("<action", StringComparison.Ordinal),
+                "a toast without a known conversation has no Mute button");
+            notifier.Shown.Clear();
             foreach (var (setting, expected) in new[]
             {
                 (NotificationSetting.DisabledForApplication, LogEvent.WindowsNotificationDisabledForApplication),
@@ -423,7 +431,7 @@ internal static class NotificationMonitorPermissionTests
 
             // C. Setting off/on and restart with a stale denial in the profile.
             settings.Current.AppNotifications = false;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
             check(!afterRecovery.IsRunning && DirectInboxMonitor.LiveCount == baseline, "disabling notifications stops the monitor");
             check(await NotificationPermissionPolicy.LogStateAsync(primary.Profile) == 22 &&
                 await primary.ExecuteScriptAsync("Notification.permission") == "\"denied\"", "disabling denies both origins");
@@ -432,7 +440,7 @@ internal static class NotificationMonitorPermissionTests
             check(ui.Popups == 3, "disabled service shows no toast");
             monitorLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
             settings.Current.AppNotifications = true;
-            await service.ApplySettingsAsync(false);
+            await service.ApplySettingsAsync();
             check(await NotificationPermissionPolicy.LogStateAsync(primary.Profile) == 11 &&
                 await primary.ExecuteScriptAsync("Notification.permission") == "\"granted\"", "re-enabling allows both origins");
             await RunningMonitorAsync("re-enabling restarts the monitor");

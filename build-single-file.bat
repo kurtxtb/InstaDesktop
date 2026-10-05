@@ -9,7 +9,6 @@ if errorlevel 1 goto failed
 echo.
 echo Build completed.
 echo EXE: %~dp0publish\single-file\InstaDesktop.exe
-echo Editable Assets are included and recreated from embedded defaults if missing.
 if /i not "%~1"=="--no-pause" pause
 exit /b 0
 :failed

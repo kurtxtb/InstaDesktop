@@ -26,7 +26,10 @@ public enum LogEvent
     MediaPermission, MediaPermissionState, MediaPermissionSync, MediaPermissionPrompt, MediaPermissionCompletionFailed,
     MediaPermissionReset, MediaPermissionMigrated, MediaPermissionBlockedNotice, MediaPrivacySettingsOpened,
     NewWindowRequested, WindowCloseRequested, MonitorCaptureBlockFailed,
-    CallWindowOpened, CallWindowClosed, CallWindowFailed
+    CallWindowOpened, CallWindowClosed, CallWindowFailed,
+    AutoRecoveryAttempt, UpdateDeferred, UpdateCleanupFailed, RendererUnresponsive,
+    DownloadStarted, DownloadFolderUnavailable, NotificationsPaused, UpdateNotice,
+    NotificationMuted, CacheCleared, CommandReceived, MessagesWindowOpened, MessagesWindowClosed, MessagesWindowFailed
 }
 
 public static class LoggingService

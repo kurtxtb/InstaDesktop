@@ -26,9 +26,10 @@ internal static class WindowLayoutTestRunner
         {
             var host = (Grid)window.FindName("BrowserHost");
             var frame = (Border)window.FindName("WindowFrame");
-            var toolbar = (RowDefinition)window.FindName("ToolbarRow");
-            var sidebar = (ColumnDefinition)window.FindName("SidebarColumn");
             var handle = new WindowInteropHelper(window).Handle;
+
+            bool FillsWidth() => Math.Abs(host.ActualWidth -
+                (frame.ActualWidth - frame.BorderThickness.Left - frame.BorderThickness.Right)) <= 1;
 
             void Check(bool condition, string name)
             {
@@ -65,7 +66,7 @@ internal static class WindowLayoutTestRunner
                 Check(fullscreen ? Math.Abs(top.Y - area.Top) <= 1 : top.Y > area.Top,
                     label + " title height");
                 Check(frame.Margin == new Thickness(0) && frame.BorderThickness == new Thickness(0), label + " no outer gutter");
-                Check(toolbar.ActualHeight == 0 && sidebar.ActualWidth == 0, label + " no legacy toolbar or sidebar");
+                Check(FillsWidth(), label + " content fills the window width");
             }
 
             foreach (var screen in Forms.Screen.AllScreens)
@@ -103,7 +104,7 @@ internal static class WindowLayoutTestRunner
                 await SettleAsync();
                 window.SetMediaFullscreen(false);
                 await SettleAsync();
-                Check(window.WindowState == WindowState.Normal && toolbar.ActualHeight == 0 && sidebar.ActualWidth == 0 &&
+                Check(window.WindowState == WindowState.Normal && FillsWidth() &&
                     Math.Abs(window.Width - restored.Width) <= 1 && Math.Abs(window.Height - restored.Height) <= 1,
                     screen.DeviceName + " fullscreen restores normal layout");
             }

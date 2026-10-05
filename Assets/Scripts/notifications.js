@@ -19,26 +19,10 @@
   let sequence = 0, badge = null, route = location.pathname;
   const epoch = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const rows = new Map();
-  const visible = el => el.getClientRects().length > 0;
   const send = candidate => post({ type: 'instadesktop:notification', sequence: epoch + ':' + (++sequence), ...candidate });
   const diagnostic = (event, count = 0) => post({ type: 'instadesktop:notification-diagnostic', event, count });
 
-  function readBadge() {
-    // Only a Messages/inbox link qualifies. A count in document.title can also
-    // represent likes or other activity, so it is deliberately not used.
-    const links = document.querySelectorAll('a[href="/direct/inbox/"],a[href="/direct/inbox"],a[href="/direct/"],a[href="https://www.instagram.com/direct/inbox/"]');
-    let found = false, count = 0;
-    for (const link of links) {
-      if (!visible(link)) continue;
-      found = true;
-      for (const el of link.querySelectorAll('span, [data-count], [data-unread-count]')) {
-        const raw = el.getAttribute('data-unread-count') ?? el.getAttribute('data-count') ??
-          (el.children.length === 0 ? el.textContent : '');
-        if (/^\s*[0-9]{1,4}\+?\s*$/.test(raw || '')) count = Math.max(count, parseInt(raw, 10));
-      }
-    }
-    return found ? count : null;
-  }
+  const readBadge = () => window.__InstaDesktopInboxDom?.readUnreadBadge() ?? null;
 
   function scan() {
     timer = null;

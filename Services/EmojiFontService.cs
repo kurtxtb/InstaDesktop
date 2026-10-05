@@ -32,12 +32,12 @@ public static class EmojiFontService
             "Content-Type: font/woff2\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: public, max-age=31536000, immutable");
     }
 
+    // Always the copy built into this version: a file on disk would survive
+    // upgrades and keep users on an outdated font.
     private static byte[]? LoadFont()
     {
         try
         {
-            string path = Path.Combine(AppPaths.Assets, "Fonts", "Twemoji.woff2");
-            if (File.Exists(path)) return File.ReadAllBytes(path);
             using var stream = typeof(EmojiFontService).Assembly.GetManifestResourceStream("InstaDesktop.Assets.Fonts.Twemoji.woff2");
             if (stream is null) return null;
             using var copy = new MemoryStream();

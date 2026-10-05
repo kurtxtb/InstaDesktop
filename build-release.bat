@@ -11,6 +11,9 @@ dotnet restore InstaDesktop.csproj
 if errorlevel 1 goto failed
 dotnet build InstaDesktop.csproj -c Release --no-restore
 if errorlevel 1 goto failed
+rem Start from an empty folder so files removed from the app never reach the installer.
+if exist "publish\win-x64" rmdir /s /q "publish\win-x64"
+if exist "publish\win-x64" goto locked
 dotnet publish InstaDesktop.csproj -c Release -p:PublishProfile=Stable
 if errorlevel 1 goto failed
 echo.
@@ -19,6 +22,9 @@ echo EXE: %~dp0publish\win-x64\InstaDesktop.exe
 echo Keep the entire publish\win-x64 folder together.
 if /i not "%~1"=="--no-pause" pause
 exit /b 0
+:locked
+echo publish\win-x64 is in use. Close InstaDesktop started from that folder and try again.
+goto failed
 :no_sdk
 echo .NET SDK 8.0.300 or newer is required.
 goto failed

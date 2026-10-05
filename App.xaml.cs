@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
+using InstaDesktop.Localization;
 using InstaDesktop.Services;
 
 namespace InstaDesktop;
@@ -27,6 +28,9 @@ public partial class App : Application
     internal int InboxDiagnosticSeconds { get; private set; } = 180;
     internal string? DiagnosticOutput { get; private set; }
     public SettingsService Settings { get; } = new();
+    // Normal mode only; null in diagnostic runs.
+    internal UpdateController? Updates { get; private set; }
+    private InstanceChannel? _channel;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -39,6 +43,7 @@ public partial class App : Application
             LoggingService.Write(LogEvent.UnexpectedException, args.Exception);
             args.SetObserved();
         };
+        Loc.Use(UiLanguage.System);
         try
         {
             int diagnosticIndex = Array.IndexOf(e.Args, "--smoke-test");
@@ -94,7 +99,7 @@ public partial class App : Application
                 else AppPaths.UseDiagnosticRoot(Path.Combine(Path.GetDirectoryName(DiagnosticOutput)!,
                     "profile-" + Guid.NewGuid().ToString("N")));
             }
-            else if (!AcquireInstance()) { Shutdown(); return; }
+            else if (!AcquireInstance(waitForPrevious: e.Args.Contains(RelaunchArgument), AppCommands.Find(e.Args))) { Shutdown(); return; }
             if (!DiagnosticMode) WindowsNotificationService.Register(arguments =>
             {
                 if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(() =>
@@ -105,37 +110,54 @@ public partial class App : Application
             });
             LoggingService.Write(LogEvent.AppStarted, code: typeof(App).Assembly.GetName().Version?.Build ?? 0);
             await Settings.LoadAsync();
-            var window = new MainWindow(Settings, e.Args.Contains("--background"));
+            // Diagnostics compare English text and the default dark look.
+            Loc.Use(DiagnosticMode ? UiLanguage.English : Settings.Current.Language);
+            ThemeService.Use(DiagnosticMode ? AppTheme.Dark : Settings.Current.Theme);
+            var startCommand = DiagnosticMode ? AppCommand.None : AppCommands.Find(e.Args);
+            var window = new MainWindow(Settings, e.Args.Contains("--background") && startCommand == AppCommand.None, startCommand);
             MainWindow = window;
             if (DiagnosticMode) { window.ShowInTaskbar = false; window.Opacity = 0; }
             window.Show();
             if (_pendingNotificationActivation is { } activation)
             { window.Notifications.Activate(activation); _pendingNotificationActivation = null; }
-            if (!DiagnosticMode) _ = CheckForUpdateAsync();
+            if (!DiagnosticMode)
+            {
+                Updates = new UpdateController(window, Settings);
+                _ = Updates.StartAsync(background: e.Args.Contains("--background"));
+                // Taskbar jump list entries start a second process that hands
+                // its command over here.
+                _channel = new InstanceChannel();
+                _channel.Listen(command => Dispatcher.BeginInvoke(new Action(() => window.RunCommand(command))));
+                AppJumpList.Apply(this);
+            }
         }
         catch (Exception error)
         {
             LoggingService.Write(LogEvent.UnexpectedException, error);
-            if (!DiagnosticMode) MessageBox.Show("InstaDesktop could not start. Check the app log.", "InstaDesktop");
+            if (!DiagnosticMode) MessageBox.Show(Loc.T("App.StartFailed"), "InstaDesktop");
             Shutdown(1);
         }
     }
 
-    private async Task CheckForUpdateAsync()
-    {
-        try
-        {
-            if (await new AutoUpdateService().TryUpdateAsync()) _ = Dispatcher.BeginInvoke(new Action(Shutdown));
-        }
-        catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
-    }
+    // A restart started by the running instance waits for it to exit.
+    internal const string RelaunchArgument = "--relaunch";
 
-    private bool AcquireInstance()
+    // command: a jump list action for an instance that is already running.
+    private bool AcquireInstance(bool waitForPrevious = false, AppCommand command = AppCommand.None)
     {
         string suffix = System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value;
         _instanceMutex = new Mutex(true, @"Local\InstaDesktop-" + suffix, out _ownsMutex);
+        if (!_ownsMutex && waitForPrevious)
+        {
+            try { _ownsMutex = _instanceMutex.WaitOne(TimeSpan.FromSeconds(20)); }
+            catch (AbandonedMutexException) { _ownsMutex = true; }
+        }
         _activation = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\InstaDesktop-Activate-" + suffix);
-        if (!_ownsMutex) { _activation.Set(); return false; }
+        if (!_ownsMutex)
+        {
+            if (command == AppCommand.None || !new InstanceChannel().Send(command)) _activation.Set();
+            return false;
+        }
         _installerMutex = new Mutex(false, @"Local\InstaDesktop-Running");
         _activationWait = ThreadPool.RegisterWaitForSingleObject(_activation, (_, _) =>
         {
@@ -149,7 +171,7 @@ public partial class App : Application
         LoggingService.Write(LogEvent.UnexpectedException, e.Exception);
         e.Handled = true;
         if (!DiagnosticMode)
-            MessageBox.Show("An unexpected error occurred. InstaDesktop will exit. Your web profile is retained.", "InstaDesktop");
+            MessageBox.Show(Loc.T("App.UnexpectedError"), "InstaDesktop");
         Shutdown(1);
     }
 
@@ -162,6 +184,9 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        Updates?.Stop();
+        _channel?.Dispose();
+        ThemeService.Stop();
         (MainWindow as MainWindow)?.DisposeResources();
         _activationWait?.Unregister(null);
         _activation?.Dispose();
