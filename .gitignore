@@ -10,3 +10,6 @@ tools/
 
 # Local-only release notes template (do not publish with source)
 RELEASE_NOTES_TEMPLATE.md
+
+# Local working notes and AI prompts (never published)
+CLAUDE_CODE_*.md

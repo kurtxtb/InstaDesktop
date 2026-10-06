@@ -9,7 +9,7 @@ under artifacts/install-backups before deployment. Copy/verification failures
 restore those backups and remove only individual files added by this operation.
 Run the publish verification scripts first. -WhatIf performs read-only planning.
 .EXAMPLE
-.\scripts\repair-local-install.ps1 -InstallDirectory 'C:\Users\CodyTw\AppData\Local\Programs\InstaDesktop' -ShortcutPath 'C:\Users\CodyTw\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\InstaDesktop\InstaDesktop.lnk' -WhatIf
+.\scripts\repair-local-install.ps1 -InstallDirectory "$env:LOCALAPPDATA\Programs\InstaDesktop" -ShortcutPath "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\InstaDesktop\InstaDesktop.lnk" -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
