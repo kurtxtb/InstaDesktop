@@ -56,7 +56,8 @@ public partial class MainWindow
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add(Loc.T("Tray.Exit"), null, async (_, _) => await ExitAsync());
         menu.Opening += (_, _) => UpdatePauseMenu();
-        _trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? (Icon)SystemIcons.Application.Clone();
+        _trayIcon = LoadAppIcon(Forms.SystemInformation.SmallIconSize) ??
+            System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? (Icon)SystemIcons.Application.Clone();
         _tray = new Forms.NotifyIcon { Icon = _trayIcon, Text = "InstaDesktop", Visible = true, ContextMenuStrip = menu };
         _tray.DoubleClick += (_, _) => ShowFromTray();
         _tray.BalloonTipClicked += (_, _) => { var click = _balloonClick; _balloonClick = null; click?.Invoke(); };
@@ -123,7 +124,7 @@ public partial class MainWindow
 
     // Taskbar overlay (Windows shows it at 16x16 over the icon's corner): a red
     // count bubble inside a ring in the taskbar's own color, so it reads as cut
-    // out of the red/pink app icon instead of merging with it.
+    // out of the app icon instead of merging with it.
     internal static ImageSource CreateOverlay(int count, bool lightTaskbar)
     {
         const double size = 32, ring = 3.5;
@@ -156,14 +157,32 @@ public partial class MainWindow
     // behind the tray (dark, light or accent) separates it from the icon.
     internal static (Icon Icon, IntPtr Handle) CreateTrayBadge(Icon source, System.Drawing.Size? requested = null)
     {
-        var size = requested ?? Forms.SystemInformation.SmallIconSize;
-        using var bitmap = new Bitmap(size.Width, size.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using var bitmap = DrawTrayBadge(source, requested ?? Forms.SystemInformation.SmallIconSize);
+        IntPtr handle = bitmap.GetHicon();
+        return (System.Drawing.Icon.FromHandle(handle), handle);
+    }
+
+    internal static Bitmap DrawTrayBadge(Icon source, System.Drawing.Size size)
+    {
+        var bitmap = new Bitmap(size.Width, size.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bitmap))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (var scaled = new Icon(source, size)) g.DrawIcon(scaled, new Rectangle(0, 0, size.Width, size.Height));
-            float outer = size.Width * 0.62f, gap = Math.Max(1.5f, size.Width / 10f);
-            var notch = new RectangleF(size.Width - outer + gap / 2, -gap / 2, outer, outer);
+            // DrawIcon crops an icon larger than the target instead of scaling it;
+            // an exact-size frame is copied as is (resampling it blurs its edges).
+            using (var picture = source.ToBitmap())
+            {
+                if (picture.Size == size) g.DrawImageUnscaled(picture, 0, 0);
+                else
+                {
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                    g.DrawImage(picture, new Rectangle(0, 0, size.Width, size.Height));
+                }
+            }
+            // A small dot in the top-right corner, where the camera's flash sits.
+            float outer = size.Width * 0.5f, gap = Math.Max(1.25f, size.Width / 12f);
+            var notch = new RectangleF(size.Width - outer, 0, outer, outer);
             var dot = RectangleF.Inflate(notch, -gap, -gap);
             g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
             using (var clear = new SolidBrush(System.Drawing.Color.Transparent)) g.FillEllipse(clear, notch);
@@ -171,14 +190,33 @@ public partial class MainWindow
             using var fill = new SolidBrush(System.Drawing.Color.FromArgb(BadgeRed.R, BadgeRed.G, BadgeRed.B));
             g.FillEllipse(fill, dot);
         }
-        IntPtr handle = bitmap.GetHicon();
-        return (System.Drawing.Icon.FromHandle(handle), handle);
+        return bitmap;
     }
 
+    // The app icon's own frame for this size (the EXE's associated icon is only
+    // 32 px, which Windows or GDI+ would have to shrink).
+    internal static Icon? LoadAppIcon(System.Drawing.Size size)
+    {
+        try
+        {
+            var resource = Application.GetResourceStream(new Uri("pack://application:,,,/Assets/Icons/app.ico"));
+            if (resource is null) return null;
+            using var stream = resource.Stream;
+            return new Icon(stream, size);
+        }
+        catch (Exception error) when (error is System.IO.IOException or ArgumentException or InvalidOperationException)
+        {
+            LoggingService.Write(LogEvent.UnexpectedException, error);
+            return null;
+        }
+    }
+
+    // Diagnostics: the badged tray picture exactly as drawn (reading it back
+    // from the icon handle would distort its semi-transparent edges).
     internal void SaveTrayIconForDiagnostics(string path)
     {
-        if (_tray?.Icon is not { } icon) return;
-        using var bitmap = icon.ToBitmap();
+        if (_trayIcon is null) return;
+        using var bitmap = DrawTrayBadge(_trayIcon, Forms.SystemInformation.SmallIconSize);
         bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
     }
 

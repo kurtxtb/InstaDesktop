@@ -250,6 +250,15 @@ internal static class SmokeTestRunner
 
                 // Only the conversations: Instagram's global navigation is hidden in the panel.
                 var panelCore = first.View.CoreWebView2!;
+                // Signed out, the inbox redirects to sign-in; a fixture added before
+                // that settles would vanish with the replaced page.
+                for (int i = 0, stable = 0; i < 40 && stable < 3; i++)
+                {
+                    string before = panelCore.Source;
+                    await Task.Delay(250);
+                    bool complete = await panelCore.ExecuteScriptAsync("document.readyState") == "\"complete\"";
+                    stable = complete && panelCore.Source == before ? stable + 1 : 0;
+                }
                 await panelCore.ExecuteScriptAsync("""
                     (() => {
                         const bar = document.createElement('div');
