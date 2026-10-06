@@ -42,6 +42,8 @@ internal static class SmokeTestRunner
             var reloaded = new SettingsService();
             await reloaded.LoadAsync();
             Check(reloaded.Current.Width == 1120 && reloaded.Current.DeveloperTools && reloaded.Current.ZoomFactor == 1.25, "settings roundtrip", checks);
+            // Deterministic start pages for the rest of this run (tested separately below).
+            await settings.UpdateAsync(s => { s.RememberLastPage = false; s.LastPage = null; });
             await settings.UpdateAsync(s => s.Left = 40);
             Check(settings.Current.Left == 40 && settings.Current.ZoomFactor == 1.25 && settings.Current.DeveloperTools,
                 "partial settings update keeps other fields", checks);
@@ -245,6 +247,42 @@ internal static class SmokeTestRunner
                 var first = window.Web.MessagesWindow!;
                 Check(await window.Web.OpenMessagesWindowAsync() && window.Web.MessagesWindow == first, "opening it again reuses the window", checks);
                 Check(first.WindowStyle == WindowStyle.None && first.Title == Loc.T("Web.MessagesTitle"), "floating panel without a browser title bar", checks);
+
+                // Only the conversations: Instagram's global navigation is hidden in the panel.
+                var panelCore = first.View.CoreWebView2!;
+                await panelCore.ExecuteScriptAsync("""
+                    (() => {
+                        const bar = document.createElement('div');
+                        bar.id = 'fx-bar';
+                        bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;height:50px;display:block;z-index:9';
+                        bar.innerHTML = '<div id="fx-inner" style="display:flex;height:50px"><a href="/">H</a><a href="/explore/">E</a>' +
+                            '<a href="/reels/">R</a><a href="/direct/inbox/">M</a><a href="/someone/">P</a></div>';
+                        const main = document.createElement('div');
+                        main.id = 'fx-main'; main.setAttribute('role', 'main');
+                        main.innerHTML = '<a href="/direct/inbox/">Inbox</a><a href="/direct/t/1/">Chat</a><textarea></textarea>';
+                        document.body.append(main, bar);
+                    })()
+                    """);
+                await Task.Delay(600);
+                Check(await panelCore.ExecuteScriptAsync(
+                    "getComputedStyle(document.getElementById('fx-bar')).display === 'none' && " +
+                    "getComputedStyle(document.getElementById('fx-main')).display !== 'none' && " +
+                    "getComputedStyle(document.querySelector('#fx-main a')).display !== 'none'") == "true",
+                    "panel hides Instagram's navigation bar and keeps the chat", checks);
+                await panelCore.ExecuteScriptAsync("document.getElementById('fx-bar').remove(); document.getElementById('fx-main').remove();");
+                Check(WebViewService.IsPanelRoute("https://www.instagram.com/direct/t/1/") && WebViewService.IsPanelRoute("https://www.instagram.com/accounts/login/") &&
+                    !WebViewService.IsPanelRoute("https://www.instagram.com/explore/") && !WebViewService.IsPanelRoute("https://www.instagram.com/someone/"),
+                    "the panel keeps Messages and sign-in only", checks);
+                var outside = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                void OnOutside(object? sender, CoreWebView2NavigationStartingEventArgs e)
+                { if (e.Uri.Contains("/explore/", StringComparison.Ordinal)) outside.TrySetResult(e.Uri); }
+                core.NavigationStarting += OnOutside;
+                var outsideLoad = WaitForLoadAsync(window.Web);
+                await panelCore.ExecuteScriptAsync("history.pushState(null, '', '/explore/')");
+                await outside.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                core.NavigationStarting -= OnOutside;
+                await outsideLoad;
+                Check(await WaitUntil(() => WebViewService.IsPanelRoute(panelCore.Source)), "a non-chat page opens in the main window, the panel stays on chat", checks);
                 // The panel's own look, for a visual check (the page area is blank here).
                 first.SetUnread(3);
                 foreach (var (theme, suffix) in new[] { (AppTheme.Dark, "dark"), (AppTheme.Light, "light") })
@@ -340,6 +378,154 @@ internal static class SmokeTestRunner
             await reloadedMutes.LoadAsync();
             Check(reloadedMutes.Current.IsMuted("https://www.instagram.com/direct/t/4242/", DateTimeOffset.UtcNow), "muted conversations survive a restart", checks);
             await settings.UpdateAsync(s => s.MutedConversations = new());
+
+            // System-wide shortcuts.
+            Check(Hotkey.Parse("ctrl+alt+i")?.ToString() == "Ctrl+Alt+I" && Hotkey.Parse("Ctrl+Alt+1")?.ToString() == "Ctrl+Alt+1" &&
+                Hotkey.Parse("Shift+A") is null && Hotkey.Parse("Ctrl+Alt") is null && Hotkey.Parse("Ctrl+Alt+65") is null &&
+                Hotkey.Parse("Win+Shift+F9")?.ToString() == "Shift+Win+F9", "shortcut text is parsed and written consistently", checks);
+            await settings.UpdateAsync(s => { s.HotkeyShowWindow = "Ctrl+Alt+Shift+F11"; s.HotkeyMessages = ""; });
+            window.ApplyHotkeys(force: true);
+            var mainHandle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+            using (var rival = new GlobalHotkeys(mainHandle))
+                Check(window.HotkeyConflicts.Count == 0 && !rival.Register(99, Hotkey.Parse("Ctrl+Alt+Shift+F11")),
+                    "a shortcut registers, and a combination already taken is reported", checks);
+            window.HideToTray(showHint: false);
+            SendMessage(mainHandle, GlobalHotkeys.WmHotkey, new IntPtr(MainWindow.HotkeyShowWindowId), IntPtr.Zero);
+            Check(await WaitUntil(() => window.IsVisible), "the show-window shortcut brings InstaDesktop back from the tray", checks);
+            await settings.UpdateAsync(s => { s.HotkeyShowWindow = ""; s.HotkeyMessages = ""; });
+            window.ApplyHotkeys(force: true);
+
+            // Reopen where you left off: path only, never sign-in or call pages.
+            Check(WebViewService.LastPageOf("https://www.instagram.com/direct/t/1/?x=1#y") == "https://www.instagram.com/direct/t/1/" &&
+                WebViewService.LastPageOf("https://www.instagram.com/accounts/login/") is null &&
+                WebViewService.LastPageOf("https://www.instagram.com/call/?id=1") is null &&
+                WebViewService.LastPageOf("https://evil.test/explore/") is null, "only ordinary Instagram pages are remembered", checks);
+            await settings.UpdateAsync(s => s.RememberLastPage = true);
+            await core.ExecuteScriptAsync("history.pushState(null, '', '/explore/')");
+            Check(await WaitUntil(() => settings.Current.LastPage == "https://www.instagram.com/explore/") &&
+                window.Web.StartPageForDiagnostics == "https://www.instagram.com/explore/", "the page in use is remembered and used at the next start", checks);
+            await settings.UpdateAsync(s => { s.RememberLastPage = false; s.LastPage = null; });
+            Check(window.Web.StartPageForDiagnostics == NavigationPolicy.Home, "turned off, InstaDesktop starts on Home", checks);
+            await core.ExecuteScriptAsync("history.replaceState(null, '', '/')");
+
+            // The shortcuts list.
+            var shortcuts = window.ShowShortcuts();
+            Check(shortcuts.IsVisible && shortcuts.RowCount == 11 && shortcuts.Title == Loc.T("Shortcuts.Title"), "the shortcuts list opens", checks);
+            shortcuts.Close();
+
+            // Diagnostics export: versions, settings shape and the event log, nothing private.
+            string zipPath = Path.ChangeExtension(output, ".diagnostics.zip");
+            var privateSettings = settings.Current.Copy();
+            privateSettings.LastPage = "https://www.instagram.com/direct/t/31415/";
+            privateSettings.DownloadFolder = @"C:\Users\Someone\Private";
+            privateSettings.MutedConversations = new Dictionary<string, DateTimeOffset> { ["https://www.instagram.com/direct/t/27182/"] = DateTimeOffset.UtcNow.AddHours(1) };
+            await DiagnosticsExport.ExportAsync(zipPath, privateSettings);
+            using (var zip = System.IO.Compression.ZipFile.OpenRead(zipPath))
+            {
+                string summary = new StreamReader(zip.GetEntry("summary.json")!.Open()).ReadToEnd();
+                Check(zip.GetEntry("logs/app.log") is not null && summary.Contains("\"mutedConversations\": 1", StringComparison.Ordinal) &&
+                    !summary.Contains("31415", StringComparison.Ordinal) && !summary.Contains("27182", StringComparison.Ordinal) &&
+                    !summary.Contains("Someone", StringComparison.Ordinal) && !summary.Contains("instagram.com", StringComparison.Ordinal),
+                    "diagnostics hold the log and settings shape without private details", checks);
+            }
+
+            // A message notification can open its conversation in the messages panel.
+            await settings.UpdateAsync(s => s.OpenNotificationsIn = NotificationOpenTarget.MessagesPanel);
+            PopoutWindow.DiagnosticHidden = true;
+            try
+            {
+                var click = new Microsoft.Toolkit.Uwp.Notifications.ToastArguments();
+                click.Add("notification", "0123456789abcdef");
+                click.Add("thread", "https://www.instagram.com/direct/t/777/");
+                window.Notifications.Activate(click.ToString());
+                Check(await WaitUntil(() => window.Web.MessagesWindow is { IsVisible: true }) &&
+                    window.Web.LastMessagesTarget == "https://www.instagram.com/direct/t/777/", "a notification click opens the conversation in the panel", checks);
+                window.Web.MessagesWindow?.CloseForGood();
+                await WaitUntil(() => window.Web.MessagesWindow is null);
+            }
+            finally
+            {
+                PopoutWindow.DiagnosticHidden = false;
+                await settings.UpdateAsync(s => s.OpenNotificationsIn = NotificationOpenTarget.MainWindow);
+            }
+
+            // Download photo / video: offline rules first.
+            var index = new MediaDownloads();
+            index.AddResponse("""
+                for (;;);{"data":{"items":[{"code":"AbCdE12345","pk":"111","user":{"username":"someone"},"media_type":8,
+                  "image_versions2":{"candidates":[{"width":640,"url":"https://a.cdninstagram.com/v/cover_640.jpg?x=1"}]},
+                  "carousel_media":[
+                    {"media_type":1,"image_versions2":{"candidates":[{"width":320,"url":"https://a.cdninstagram.com/v/one.jpg?s=320"},{"width":1440,"url":"https://a.cdninstagram.com/v/one.jpg?s=1440"}]}},
+                    {"media_type":2,"video_versions":[{"url":"https://a.fbcdn.net/v/two.mp4?x=1"}],"image_versions2":{"candidates":[{"width":640,"url":"https://a.cdninstagram.com/v/two_cover.jpg"}]}},
+                    {"media_type":2,"video_versions":[{"url":"https://a.fbcdn.net/v/three.mp4?x=1"}],"image_versions2":{"candidates":[{"width":640,"url":"https://a.cdninstagram.com/v/three_cover.jpg"}]}}]}]}}
+                """);
+            var album = index.Find("AbCdE12345");
+            Check(album is not null && album.Owner == "someone" && album.Children.Count == 3 && index.Find("111") == album,
+                "post data is read from Instagram's API responses", checks);
+            var photoTarget = new MediaTarget("image", "https://a.cdninstagram.com/v/one.jpg?s=320", "one.jpg", Array.Empty<string>(), "AbCdE12345", null);
+            var videoTarget = new MediaTarget("video", "blob:https://www.instagram.com/x", "", new[] { "three_cover.jpg" }, "AbCdE12345", null);
+            Check(MediaDownloads.Choose(photoTarget, album) == "https://a.cdninstagram.com/v/one.jpg?s=1440" &&
+                MediaDownloads.Choose(videoTarget, album) == "https://a.fbcdn.net/v/three.mp4?x=1" &&
+                MediaDownloads.BaseName(photoTarget, album) == "someone_AbCdE12345_1" &&
+                MediaDownloads.Choose(videoTarget with { Near = Array.Empty<string>() }, album) is null,
+                "the largest picture and the right album video are chosen", checks);
+            Check(MediaDownloads.IsMediaHost("https://scontent-tpe1-1.cdninstagram.com/v/a.jpg") && MediaDownloads.IsMediaHost("https://x.fna.fbcdn.net/o1/v.mp4") &&
+                !MediaDownloads.IsMediaHost("http://x.fbcdn.net/a.jpg") && !MediaDownloads.IsMediaHost("https://fbcdn.net.evil.test/a.jpg") &&
+                !MediaDownloads.IsMediaHost("https://www.instagram.com/a.jpg"), "downloads only from Instagram's media servers", checks);
+
+            // Then for real, on Instagram's public profile (signed out).
+            string mediaFolder = Path.Combine(AppPaths.Root, "media-check");
+            await settings.UpdateAsync(s => { s.DownloadFolder = mediaFolder; s.AskDownloadLocation = false; });
+            var profileLoad = WaitForLoadAsync(window.Web);
+            core.Navigate("https://www.instagram.com/instagram/");
+            await profileLoad;
+            string links = "";
+            for (int i = 0; i < 40 && (links == "" || links == "[]"); i++)
+            {
+                await Task.Delay(250);
+                links = JsonSerializer.Deserialize<string>(await core.ExecuteScriptAsync(
+                    "JSON.stringify([...document.querySelectorAll('a[href*=\"/p/\"], a[href*=\"/reel/\"]')].map(a => a.getAttribute('href')))"))!;
+            }
+            var hrefs = JsonSerializer.Deserialize<string[]>(links)!;
+            string? photoPost = hrefs.FirstOrDefault(h => h.Contains("/p/", StringComparison.Ordinal));
+            string? reelPost = hrefs.FirstOrDefault(h => h.Contains("/reel/", StringComparison.Ordinal));
+            checks["publicPosts"] = hrefs.Length;
+            Check(photoPost is not null && reelPost is not null, "public posts found to download from", checks);
+
+            var postLoad = WaitForLoadAsync(window.Web);
+            core.Navigate("https://www.instagram.com" + photoPost);
+            await postLoad;
+            await Task.Delay(2500); // let the post render
+            await core.ExecuteScriptAsync("""
+                (() => {
+                    const img = [...document.querySelectorAll('img')].sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+                    const r = img.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+                    document.elementsFromPoint(x, y)[0].dispatchEvent(new MouseEvent('contextmenu', { clientX: x, clientY: y, bubbles: true, cancelable: true }));
+                })()
+                """);
+            var clicked = await WebViewService.TakeMediaTargetAsync(core);
+            var savedPhoto = clicked is null ? null : await window.Web.DownloadMediaAsync(core, clicked);
+            byte[] photoHead = savedPhoto?.Path is { } photoPath && File.Exists(photoPath) ? File.ReadAllBytes(photoPath)[..4] : Array.Empty<byte>();
+            checks["photoSaved"] = savedPhoto?.Path is { } shownPhoto ? Path.GetFileName(shownPhoto) : savedPhoto?.Outcome.ToString() ?? "no target";
+            Check(clicked is { Kind: "image" } && savedPhoto?.Outcome == MediaDownloadOutcome.Saved &&
+                (photoHead is [0xFF, 0xD8, ..] || photoHead is [(byte)'R', (byte)'I', (byte)'F', (byte)'F']) &&
+                new FileInfo(savedPhoto.Path!).Length > 10_000, "right-click Download photo saves the post's picture", checks);
+
+            string reelCode = System.Text.RegularExpressions.Regex.Match(reelPost!, @"/reel/([A-Za-z0-9_-]+)").Groups[1].Value;
+            var reelLoad = WaitForLoadAsync(window.Web);
+            core.Navigate("https://www.instagram.com" + reelPost);
+            await reelLoad;
+            await Task.Delay(1500);
+            var savedVideo = await window.Web.DownloadMediaAsync(core,
+                new MediaTarget("video", "blob:https://www.instagram.com/stream", "", Array.Empty<string>(), reelCode, null));
+            byte[] videoHead = savedVideo.Path is { } videoPath && File.Exists(videoPath) ? File.ReadAllBytes(videoPath)[..8] : Array.Empty<byte>();
+            checks["videoSaved"] = savedVideo.Path is { } shownVideo ? Path.GetFileName(shownVideo) : savedVideo.Outcome.ToString();
+            Check(savedVideo.Outcome == MediaDownloadOutcome.Saved && System.Text.Encoding.ASCII.GetString(videoHead, 4, 4) == "ftyp" &&
+                new FileInfo(savedVideo.Path!).Length > 100_000, "Download video saves the whole MP4 of a streamed reel", checks);
+            await settings.UpdateAsync(s => s.DownloadFolder = null);
+            var homeLoad = WaitForLoadAsync(window.Web);
+            core.Navigate(NavigationPolicy.Home);
+            await homeLoad;
 
             var appearance = settings.Current.Copy();
             appearance.DeveloperTools = true;

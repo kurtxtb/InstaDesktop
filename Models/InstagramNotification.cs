@@ -25,6 +25,8 @@ public sealed record InstagramNotification
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
     public bool HasSourceTimestamp { get; init; }
     public bool Silent { get; init; }
+    // Messages of one conversation shown together in this toast (1 = just this).
+    public int GroupedCount { get; init; } = 1;
     public NotificationSource Source { get; init; }
     // Which controller raised a native event ("primary" or "monitor"). Both pages
     // can mirror one message; never shown, logged or used for navigation.

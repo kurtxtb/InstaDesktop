@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
 using System.Runtime.InteropServices;
@@ -45,11 +46,7 @@ public partial class MainWindow : Window
         _startCommand = startCommand;
         InitializeComponent();
         RestoreWindow();
-        Notifications = new NotificationService(Dispatcher, () => NotificationsActive, thread =>
-        {
-            ShowFromTray();
-            _web?.NavigateNotificationThread(thread);
-        })
+        Notifications = new NotificationService(Dispatcher, () => NotificationsActive, OpenFromNotification)
         {
             SoundEnabled = () => _settings.Current.NotificationSound,
             HideContent = () => _settings.Current.HideNotificationContent,
@@ -63,6 +60,7 @@ public partial class MainWindow : Window
         _web.MediaBlocked += ShowMediaBlocked;
         _web.ZoomChanged += ShowZoom;
         _web.UnreadCountChanged += _ => UpdateUnreadBadge();
+        _web.MediaDownloadFinished += ShowMediaDownload;
         _settings.Changed += SettingsChanged;
         ThemeService.WindowsThemeChanged += WindowsThemeChanged;
         _web.StatusChanged += (message, recoverable) =>
@@ -80,6 +78,8 @@ public partial class MainWindow : Window
         {
             HwndSource.FromHwnd(new WindowInteropHelper(this).Handle).AddHook(WindowMessages);
             ClampWindowToMonitor();
+            // Diagnostics never take the user's real system-wide shortcuts.
+            if (!((App)Application.Current).DiagnosticMode) ApplyHotkeys();
         };
     }
 
@@ -110,6 +110,66 @@ public partial class MainWindow : Window
         if (_startInBackground) { HideToTray(showHint: false); Opacity = 1; ShowInTaskbar = true; }
         UpdateBackgroundState();
         if (_startCommand != AppCommand.None) RunCommand(_startCommand);
+    }
+
+    // A clicked notification: a conversation goes to the messages panel when
+    // chosen in Settings (and the main page is ready to lend it its profile).
+    private void OpenFromNotification(string? thread)
+    {
+        if (_disposed) return;
+        if (thread is not null && _settings.Current.OpenNotificationsIn == NotificationOpenTarget.MessagesPanel && _web.CanOpenMessagesWindow)
+        {
+            _ = RunActionAsync(() => _web.OpenMessagesWindowAsync(thread));
+            return;
+        }
+        ShowFromTray();
+        _web.NavigateNotificationThread(thread);
+    }
+
+    // ---- System-wide shortcuts ------------------------------------------------
+
+    internal const int HotkeyShowWindowId = 1, HotkeyMessagesId = 2;
+    private GlobalHotkeys? _hotkeys;
+    private string? _appliedHotkeys;
+    // Shortcuts another app already owns (Settings shows them).
+    internal HashSet<int> HotkeyConflicts { get; } = new();
+
+    internal void ApplyHotkeys(bool force = false)
+    {
+        if (_disposed) return;
+        string wanted = _settings.Current.HotkeyShowWindow + "|" + _settings.Current.HotkeyMessages;
+        if (!force && wanted == _appliedHotkeys) return;
+        _appliedHotkeys = wanted;
+        _hotkeys ??= new GlobalHotkeys(new WindowInteropHelper(this).Handle);
+        HotkeyConflicts.Clear();
+        if (!_hotkeys.Register(HotkeyShowWindowId, Hotkey.Parse(_settings.Current.HotkeyShowWindow))) HotkeyConflicts.Add(HotkeyShowWindowId);
+        if (!_hotkeys.Register(HotkeyMessagesId, Hotkey.Parse(_settings.Current.HotkeyMessages))) HotkeyConflicts.Add(HotkeyMessagesId);
+        LoggingService.Write(LogEvent.HotkeysRegistered, code: HotkeyConflicts.Count);
+    }
+
+    internal void HotkeyPressed(int id)
+    {
+        if (id == HotkeyShowWindowId) ToggleMainWindow();
+        else if (id == HotkeyMessagesId) _ = RunActionAsync(_web.ToggleMessagesWindowAsync);
+    }
+
+    // In front: back to the tray. Hidden, minimized or behind: to the front.
+    internal void ToggleMainWindow()
+    {
+        if (IsVisible && WindowState != WindowState.Minimized && IsActive) HideToTray(showHint: false);
+        else ShowFromTray();
+    }
+
+    // Ctrl+/ or F1.
+    private ShortcutsWindow? _shortcutsWindow;
+    internal ShortcutsWindow ShowShortcuts()
+    {
+        if (_shortcutsWindow is { } open) { open.Activate(); return open; }
+        var window = new ShortcutsWindow(_settings.Current) { Owner = IsVisible ? this : null };
+        window.Closed += (_, _) => _shortcutsWindow = null;
+        _shortcutsWindow = window;
+        window.Show();
+        return window;
     }
 
     // A taskbar jump list entry (or the same command-line argument).
@@ -317,6 +377,13 @@ public partial class MainWindow : Window
             if (message == 0x00A2) ToggleMaximize();
             return IntPtr.Zero;
         }
+        if (message == GlobalHotkeys.WmHotkey)
+        {
+            int id = wParam.ToInt32();
+            Dispatcher.BeginInvoke(new Action(() => HotkeyPressed(id)));
+            handled = true;
+            return IntPtr.Zero;
+        }
         const int WmExitSizeMove = 0x0232;
         if (message == WmExitSizeMove && _initialized && !_disposed)
             Dispatcher.BeginInvoke(new Action(() => { _ = RunActionAsync(SavePlacementAsync); }));
@@ -355,6 +422,8 @@ public partial class MainWindow : Window
             action = () => { if (_web.Core?.CanGoBack == true) _web.Core.GoBack(); return Task.CompletedTask; };
         else if (key == Key.Right && modifiers == ModifierKeys.Alt)
             action = () => { if (_web.Core?.CanGoForward == true) _web.Core.GoForward(); return Task.CompletedTask; };
+        else if ((key is Key.OemQuestion && modifiers == ModifierKeys.Control) || (key == Key.F1 && modifiers == ModifierKeys.None))
+            action = () => { ShowShortcuts(); return Task.CompletedTask; };
         else if (key == Key.OemComma && modifiers == ModifierKeys.Control)
             action = () => { ShowSettings(); return Task.CompletedTask; };
         else if (key == Key.F12 && _settings.Current.DeveloperTools)
@@ -395,6 +464,7 @@ public partial class MainWindow : Window
         _disposed = true;
         _settings.Changed -= SettingsChanged;
         ThemeService.WindowsThemeChanged -= WindowsThemeChanged;
+        _hotkeys?.Dispose();
         _pauseTimer?.Stop();
         Notifications.Dispose();
         _web.Dispose();
@@ -417,6 +487,23 @@ public partial class MainWindow : Window
 
     private void ZoomReset_Click(object sender, RoutedEventArgs e) => _web.ResetZoom();
 
+    // Right-click > Download photo / video finished.
+    private void ShowMediaDownload(MediaDownloadResult result, bool video)
+    {
+        switch (result.Outcome)
+        {
+            case MediaDownloadOutcome.Saved when result.Path is { } path:
+                ShowBalloon(Loc.F("Media.Saved", System.IO.Path.GetFileName(path)), Loc.T("Media.SavedText"), () => ShellService.ShowInFolder(path));
+                break;
+            case MediaDownloadOutcome.VideoUnavailable:
+                ShowBalloon("Instagram", Loc.T("Media.VideoUnavailable"), null, Forms.ToolTipIcon.Info);
+                break;
+            case MediaDownloadOutcome.Failed:
+                ShowBalloon("Instagram", Loc.T("Media.Failed"), null, Forms.ToolTipIcon.Warning);
+                break;
+        }
+    }
+
     private void ShowNotice(string message) => ShowBalloon("Instagram", message.Replace('\n', ' '), null, milliseconds: 5000);
     private async void MessagesWindow_Click(object sender, RoutedEventArgs e) => await RunActionAsync(_web.ToggleMessagesWindowAsync);
 
@@ -427,6 +514,7 @@ public partial class MainWindow : Window
         if (_disposed) return;
         UpdateUnreadBadge();
         SchedulePauseEnd();
+        if (_hotkeys is not null) ApplyHotkeys();
     }
 
     // Low-key and actionable: one tray notice (throttled by WebViewService),

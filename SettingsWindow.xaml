@@ -154,6 +154,13 @@
                                 <ComboBoxItem Content="{l:T General.LanguageSystem}" /><ComboBoxItem Content="English" /><ComboBoxItem Content="繁體中文" />
                             </ComboBox>
                         </Grid>
+                        <Border Style="{StaticResource RowDivider}" />
+                        <CheckBox x:Name="RememberPageCheck" Style="{StaticResource SettingRow}" AutomationProperties.Name="{l:T General.RememberPage}">
+                            <StackPanel>
+                                <TextBlock Text="{l:T General.RememberPage}" Style="{StaticResource RowTitle}" />
+                                <TextBlock Text="{l:T General.RememberPageHint}" Style="{StaticResource RowHint}" />
+                            </StackPanel>
+                        </CheckBox>
                     </StackPanel>
                 </Border>
 
@@ -198,6 +205,17 @@
                             </StackPanel>
                         </CheckBox>
                         <Border Style="{StaticResource RowDivider}" />
+                        <Grid Style="{StaticResource ChoiceRow}">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center" Margin="0,0,16,0">
+                                <TextBlock Text="{l:T Notif.OpenIn}" Style="{StaticResource RowTitle}" />
+                                <TextBlock Text="{l:T Notif.OpenInHint}" Style="{StaticResource RowHint}" />
+                            </StackPanel>
+                            <ComboBox x:Name="OpenInCombo" Grid.Column="1" VerticalAlignment="Center" AutomationProperties.Name="{l:T Notif.OpenIn}">
+                                <ComboBoxItem Content="{l:T Notif.OpenInMain}" /><ComboBoxItem Content="{l:T Notif.OpenInPanel}" />
+                            </ComboBox>
+                        </Grid>
+                        <Border Style="{StaticResource RowDivider}" />
                         <DockPanel Margin="0,12,0,8">
                             <Button x:Name="UnmuteAllButton" DockPanel.Dock="Right" Content="{l:T Notif.UnmuteAll}" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center" Click="UnmuteAll_Click" />
                             <StackPanel VerticalAlignment="Center">
@@ -205,6 +223,37 @@
                                 <TextBlock x:Name="MutedText" Style="{StaticResource RowHint}" />
                             </StackPanel>
                         </DockPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Keyboard shortcuts -->
+                <TextBlock Text="{l:T Section.Shortcuts}" Style="{StaticResource SectionHeader}" />
+                <Border Style="{StaticResource Card}">
+                    <StackPanel>
+                        <TextBlock Margin="0,12,0,4" Style="{StaticResource RowHint}" Text="{l:T Shortcuts.GlobalHint}" />
+                        <Grid Style="{StaticResource ChoiceRow}">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center" Margin="0,0,16,0">
+                                <TextBlock Text="{l:T Shortcuts.ShowWindow}" Style="{StaticResource RowTitle}" />
+                                <TextBlock x:Name="HotkeyShowState" Style="{StaticResource RowHint}" />
+                            </StackPanel>
+                            <TextBox x:Name="HotkeyShowBox" Grid.Column="1" Tag="show" IsReadOnly="True" IsReadOnlyCaretVisible="False" VerticalAlignment="Center"
+                                     PreviewKeyDown="HotkeyBox_PreviewKeyDown" AutomationProperties.Name="{l:T Shortcuts.ShowWindow}" />
+                        </Grid>
+                        <Border Style="{StaticResource RowDivider}" />
+                        <Grid Style="{StaticResource ChoiceRow}">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /></Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center" Margin="0,0,16,0">
+                                <TextBlock Text="{l:T Shortcuts.MessagesPanel}" Style="{StaticResource RowTitle}" />
+                                <TextBlock x:Name="HotkeyMessagesState" Style="{StaticResource RowHint}" />
+                            </StackPanel>
+                            <TextBox x:Name="HotkeyMessagesBox" Grid.Column="1" Tag="messages" IsReadOnly="True" IsReadOnlyCaretVisible="False" VerticalAlignment="Center"
+                                     PreviewKeyDown="HotkeyBox_PreviewKeyDown" AutomationProperties.Name="{l:T Shortcuts.MessagesPanel}" />
+                        </Grid>
+                        <Border Style="{StaticResource RowDivider}" />
+                        <WrapPanel Margin="0,12,0,4">
+                            <Button Content="{l:T Shortcuts.ViewAll}" Style="{StaticResource LinkButton}" Click="ViewShortcuts_Click" />
+                        </WrapPanel>
                     </StackPanel>
                 </Border>
 
@@ -327,6 +376,7 @@
                         <TextBlock Margin="0,12,0,8" Style="{StaticResource RowHint}" Text="{l:T Adv.ClearCacheHint}" />
                         <WrapPanel Margin="0,0,0,4">
                             <Button x:Name="ClearCacheButton" Content="{l:T Adv.ClearCache}" Style="{StaticResource LinkButton}" Click="ClearCache_Click" />
+                            <Button x:Name="ExportDiagnosticsButton" Content="{l:T Adv.Export}" Style="{StaticResource LinkButton}" Click="ExportDiagnostics_Click" />
                             <Button Content="{l:T Adv.OpenLogs}" Style="{StaticResource LinkButton}" Click="Logs_Click" />
                         </WrapPanel>
                     </StackPanel>

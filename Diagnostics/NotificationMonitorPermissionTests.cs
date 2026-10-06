@@ -179,6 +179,9 @@ internal static class NotificationMonitorPermissionTests
             presenter.Show(sample with { ThreadUrl = null }, "0123456789abcdee", null, null, false);
             check(!notifier.Shown[^1].Content.GetXml().Contains("<action", StringComparison.Ordinal),
                 "a toast without a known conversation has no Mute button");
+            presenter.Show(sample with { GroupedCount = 3 }, "0123456789abcded", null, null, false);
+            check(notifier.Shown[^1].Content.GetXml().Contains("+2 earlier", StringComparison.Ordinal),
+                "a grouped toast says how many earlier messages it stands for");
             notifier.Shown.Clear();
             foreach (var (setting, expected) in new[]
             {

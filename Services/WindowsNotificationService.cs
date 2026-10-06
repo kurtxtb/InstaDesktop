@@ -98,6 +98,8 @@ internal sealed class WindowsNotificationService : IWindowsNotificationPresenter
                 .AddArgument("thread", n.ThreadUrl ?? "").AddText(n.Title).AddText(n.Body);
             if (avatar is not null) builder.AddAppLogoOverride(new Uri(avatar), ToastGenericAppLogoCrop.Circle);
             if (image is not null) builder.AddHeroImage(new Uri(image));
+            if (n.GroupedCount > 1)
+                builder.AddAttributionText(InstaDesktop.Localization.Loc.F("Notify.EarlierMessages", n.GroupedCount - 1));
             if (n.Silent) builder.AddAudio(new ToastAudio { Silent = true });
             // Only a known conversation can be muted; the click is handled in the background.
             if (n.ThreadUrl is not null)

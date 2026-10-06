@@ -16,7 +16,10 @@
 - A separate messages window (Ctrl+Shift+M) next to whatever else is open
 - Light or dark, following Windows; English or Traditional Chinese (繁體中文) interface
 - Taskbar jump list: open a section or the messages window, pause or resume notifications
+- System-wide shortcuts, reopening on the last page used, and one notification per conversation
+- Settings > Advanced > Export diagnostics: a zip of versions and the app log for bug reports, without messages, names or page addresses
 - Downloads saved straight to your Downloads folder (or one you choose), or ask each time
+- Right-click a photo or video > Download: the full-resolution photo, or the whole video with sound, named after the account and post
 - Calls in their own window, optionally always on top
 - Self-contained, single-file, and automatic GitHub Release updates
 
@@ -37,7 +40,9 @@ Turn off **Settings > Updates > Install updates automatically** to decide yourse
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+1 / 2 / 3 / 4 | Home / Messages / Reels / Explore |
-| Ctrl+Shift+M | Messages window |
+| Ctrl+Shift+M | Messages panel |
+| Ctrl+Alt+I / Ctrl+Alt+M (from any app, configurable) | Show or hide InstaDesktop / the messages panel |
+| Ctrl+/ or F1 | All keyboard shortcuts |
 | Ctrl+= / Ctrl+- / Ctrl+0 (or Ctrl+wheel) | Zoom in / out / reset (remembered) |
 | F5 or Ctrl+R | Reload |
 | Alt+Left / Alt+Right | Back / Forward |

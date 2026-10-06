@@ -12,8 +12,12 @@ if errorlevel 1 goto failed
 dotnet build InstaDesktop.csproj -c Release --no-restore
 if errorlevel 1 goto failed
 rem Start from an empty folder so files removed from the app never reach the installer.
-if exist "publish\win-x64" rmdir /s /q "publish\win-x64"
+rem Moving the folder fails as a whole while InstaDesktop runs from it, so a
+rem running copy is never left with half of its files deleted.
+if exist "publish\win-x64.old" rmdir /s /q "publish\win-x64.old"
+if exist "publish\win-x64" move "publish\win-x64" "publish\win-x64.old" >nul 2>nul
 if exist "publish\win-x64" goto locked
+if exist "publish\win-x64.old" rmdir /s /q "publish\win-x64.old"
 dotnet publish InstaDesktop.csproj -c Release -p:PublishProfile=Stable
 if errorlevel 1 goto failed
 echo.

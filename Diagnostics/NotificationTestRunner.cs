@@ -153,6 +153,28 @@ internal static class NotificationTestRunner
                 coordinator.Activate(mute.ToString());
                 Check(muteRequested == (presenter.Shows[0].Value.ThreadUrl ?? "https://www.instagram.com/direct/t/987/") && activated is null,
                     "Mute mutes the conversation and does not open the window");
+                coordinator.Reset(false); presenter.Shows.Clear();
+
+                // One toast per conversation: later messages take its place.
+                const string groupThread = "https://www.instagram.com/direct/t/555/";
+                var groupFirst = native with { ThreadUrl = groupThread, Type = InstagramNotificationType.DirectMessage, Body = "first" };
+                coordinator.Receive(groupFirst);
+                await Task.Delay(400);
+                coordinator.Receive(groupFirst with { Body = "second" });
+                await Task.Delay(400);
+                Check(presenter.Shows.Count == 2 && presenter.Shows[1].Token == presenter.Shows[0].Token && !presenter.Shows[1].Replace &&
+                    presenter.Shows[1].Value.GroupedCount == 2 && presenter.Shows[1].Value.Body == "second",
+                    "a conversation's next message replaces its toast and pops up again");
+                coordinator.Receive(groupFirst with { ThreadUrl = "https://www.instagram.com/direct/t/556/", Body = "elsewhere" });
+                await Task.Delay(400);
+                Check(presenter.Shows.Count == 3 && presenter.Shows[2].Token != presenter.Shows[0].Token && presenter.Shows[2].Value.GroupedCount == 1,
+                    "another conversation gets its own toast");
+                presenter.Dismiss(presenter.Shows[0].Token);
+                await Task.Delay(200);
+                coordinator.Receive(groupFirst with { Body = "third" });
+                await Task.Delay(400);
+                Check(presenter.Shows.Count == 4 && presenter.Shows[3].Token != presenter.Shows[0].Token && presenter.Shows[3].Value.GroupedCount == 1,
+                    "after a toast is dismissed the conversation starts a new one");
                 coordinator.Reset(false); presenter.Shows.Clear(); enabled = false;
                 coordinator.Receive(native);
                 Check(presenter.Shows.Count == 0, "disabled mode ignores native candidates");

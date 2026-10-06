@@ -171,6 +171,8 @@ internal sealed class MessagesWindow : PopoutWindow
         });
         MinWidth = 340;
         MinHeight = 420;
+        // Narrower than Instagram's desktop layout, so it keeps the chat layout.
+        MaxWidth = 720;
         Width = width;
         Height = height;
 

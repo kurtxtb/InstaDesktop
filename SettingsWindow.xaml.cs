@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
@@ -32,6 +33,11 @@ public partial class SettingsWindow : Window
             StatusText.Text = Loc.T("Settings.StartupUnavailable");
         }
         CloseBehaviorCombo.SelectedIndex = (int)s.CloseButton;
+        OpenInCombo.SelectedIndex = (int)s.OpenNotificationsIn;
+        RememberPageCheck.IsChecked = s.RememberLastPage;
+        _hotkeyShow = s.HotkeyShowWindow;
+        _hotkeyMessages = s.HotkeyMessages;
+        ShowHotkeys();
         ThemeCombo.SelectedIndex = (int)s.Theme;
         LanguageCombo.SelectedIndex = (int)s.Language;
         HardwareCheck.IsChecked = s.HardwareAcceleration;
@@ -107,6 +113,11 @@ public partial class SettingsWindow : Window
             next.Language != (UiLanguage)Math.Clamp(LanguageCombo.SelectedIndex, 0, 2);
         next.StartWithWindows = StartupCheck.IsChecked == true;
         next.CloseButton = (CloseButtonBehavior)CloseBehaviorCombo.SelectedIndex;
+        next.OpenNotificationsIn = (NotificationOpenTarget)Math.Clamp(OpenInCombo.SelectedIndex, 0, 1);
+        next.RememberLastPage = RememberPageCheck.IsChecked == true;
+        if (!next.RememberLastPage) next.LastPage = null;
+        next.HotkeyShowWindow = _hotkeyShow;
+        next.HotkeyMessages = _hotkeyMessages;
         next.Theme = (AppTheme)Math.Clamp(ThemeCombo.SelectedIndex, 0, 2);
         next.Language = (UiLanguage)Math.Clamp(LanguageCombo.SelectedIndex, 0, 2);
         next.HardwareAcceleration = HardwareCheck.IsChecked == true;
@@ -162,6 +173,67 @@ public partial class SettingsWindow : Window
     }
 
     private void Window_Closing(object? sender, CancelEventArgs e) { if (_saving) e.Cancel = true; }
+
+    // ---- System-wide shortcuts: press the keys in the box to set them -----------
+
+    private string _hotkeyShow = "", _hotkeyMessages = "";
+
+    private void ShowHotkeys()
+    {
+        HotkeyShowBox.Text = string.IsNullOrEmpty(_hotkeyShow) ? Loc.T("Shortcuts.Off") : _hotkeyShow;
+        HotkeyMessagesBox.Text = string.IsNullOrEmpty(_hotkeyMessages) ? Loc.T("Shortcuts.Off") : _hotkeyMessages;
+        var conflicts = (Owner as MainWindow)?.HotkeyConflicts;
+        string State(string value, string saved, int id) =>
+            value != saved ? Loc.T("Shortcuts.SaveToApply")
+            : conflicts?.Contains(id) == true && !string.IsNullOrEmpty(value) ? Loc.T("Shortcuts.InUse")
+            : Loc.T("Shortcuts.Hint");
+        HotkeyShowState.Text = State(_hotkeyShow, _settings.Current.HotkeyShowWindow, MainWindow.HotkeyShowWindowId);
+        HotkeyMessagesState.Text = State(_hotkeyMessages, _settings.Current.HotkeyMessages, MainWindow.HotkeyMessagesId);
+    }
+
+    private void HotkeyBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.TextBox box) return;
+        var key = e.Key == System.Windows.Input.Key.System ? e.SystemKey : e.Key;
+        var modifiers = System.Windows.Input.Keyboard.Modifiers;
+        // Tab still moves between controls.
+        if (key == System.Windows.Input.Key.Tab && (modifiers & ~System.Windows.Input.ModifierKeys.Shift) == 0) return;
+        e.Handled = true;
+        string? value = null;
+        if (modifiers == System.Windows.Input.ModifierKeys.None && key is System.Windows.Input.Key.Back or System.Windows.Input.Key.Delete)
+            value = "";
+        else if (!Hotkey.IsModifier(key) && new Hotkey(modifiers, key) is { IsValid: true } hotkey)
+            value = hotkey.ToString();
+        if (value is null) return; // a modifier alone, or a combination without Ctrl/Alt/Win
+        if ((string)box.Tag == "show") _hotkeyShow = value; else _hotkeyMessages = value;
+        ShowHotkeys();
+    }
+
+    private void ViewShortcuts_Click(object sender, RoutedEventArgs e) => (Owner as MainWindow)?.ShowShortcuts();
+
+    private async void ExportDiagnostics_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = Loc.T("Adv.ExportTitle"), FileName = DiagnosticsExport.DefaultFileName,
+            Filter = Loc.T("Adv.ExportFilter"), DefaultExt = ".zip",
+            InitialDirectory = _settings.Current.DownloadFolder ?? ShellService.DownloadsFolder
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        ExportDiagnosticsButton.IsEnabled = false;
+        try
+        {
+            await DiagnosticsExport.ExportAsync(dialog.FileName, _settings.Current);
+            StatusText.Text = Loc.T("Adv.Exported");
+            ShellService.ShowInFolder(dialog.FileName);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidDataException)
+        {
+            LoggingService.Write(LogEvent.UnexpectedException, error);
+            StatusText.Text = Loc.T("Adv.ExportFailed");
+        }
+        finally { ExportDiagnosticsButton.IsEnabled = true; }
+    }
     private void Cancel_Click(object sender, RoutedEventArgs e) => Close();
     private void Logs_Click(object sender, RoutedEventArgs e) => OpenFolder(AppPaths.Logs);
 

@@ -29,7 +29,8 @@ public enum LogEvent
     CallWindowOpened, CallWindowClosed, CallWindowFailed,
     AutoRecoveryAttempt, UpdateDeferred, UpdateCleanupFailed, RendererUnresponsive,
     DownloadStarted, DownloadFolderUnavailable, NotificationsPaused, UpdateNotice,
-    NotificationMuted, CacheCleared, CommandReceived, MessagesWindowOpened, MessagesWindowClosed, MessagesWindowFailed
+    NotificationMuted, CacheCleared, CommandReceived, MessagesWindowOpened, MessagesWindowClosed, MessagesWindowFailed,
+    HotkeysRegistered, DiagnosticsExported, MediaDownloaded, MediaDownloadFailed
 }
 
 public static class LoggingService

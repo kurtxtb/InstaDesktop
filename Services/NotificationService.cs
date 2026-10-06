@@ -33,7 +33,16 @@ public sealed class NotificationService : IDisposable
         public bool Submitted, Closed, TextRetried;
         public string? AvatarPath, ImagePath;
         public bool AwaitingEnrichment, WasGeneric, InboxEvidence;
+        // Grouping: a later message of the same conversation reuses the toast
+        // of the one before it (same Windows tag), so Action Center keeps one
+        // entry per conversation. Token stays this delivery's own identity.
+        public string? GroupToken;
+        public string ToastToken => GroupToken ?? Token;
+        public int GroupCount = 1;
     }
+
+    // How long a conversation's toast keeps collecting new messages.
+    internal static TimeSpan GroupWindow { get; set; } = TimeSpan.FromHours(1);
 
     private readonly Dispatcher _dispatcher;
     private readonly Func<bool> _enabled;
@@ -70,7 +79,12 @@ public sealed class NotificationService : IDisposable
             n = n with { Body = Loc.T(message ? "Notify.HiddenMessage" : "Notify.HiddenActivity"), ImageUrl = null };
             image = null;
         }
-        bool shown = _windows.Show(n, d.Token, avatar, image, replace);
+        if (d.GroupCount > 1)
+        {
+            n = n with { GroupedCount = d.GroupCount };
+            if (HideContent()) n = n with { Body = Loc.F("Notify.HiddenMessages", d.GroupCount) };
+        }
+        bool shown = _windows.Show(n, d.ToastToken, avatar, image, replace);
         if (shown && !replace && announce) Presented?.Invoke();
         return shown;
     }
@@ -90,11 +104,11 @@ public sealed class NotificationService : IDisposable
         {
             // Timeout dismisses only the banner; the notification is still clickable
             // in Notification Center. Retain its native lifecycle until user removal.
-            if (userCanceled && Find(token) is { } d) Close(d, remove: false);
+            if (userCanceled && FindToast(token) is { } d) Close(d, remove: false);
         });
         _windows.Failed += token => Dispatch(() =>
         {
-            if (Find(token) is not { } d || d.Closed || !_enabled() || d.TextRetried) return;
+            if (FindToast(token) is not { } d || d.Closed || !_enabled() || d.TextRetried) return;
             d.TextRetried = true;
             if (Present(d, null, null, replace: false, announce: false)) ReportShown(d);
         });
@@ -229,6 +243,14 @@ public sealed class NotificationService : IDisposable
             if (!CanShow(delivery)) return;
             delivery.AvatarPath = await avatar;
             delivery.ImagePath = await image;
+            if (GroupFor(delivery) is { } group)
+            {
+                // Replace that conversation's toast: it pops up again with this
+                // message and how many came before it.
+                delivery.GroupToken = group.ToastToken;
+                delivery.GroupCount = group.GroupCount + 1;
+                Close(group, remove: false);
+            }
             delivery.Submitted = Present(delivery, delivery.AvatarPath, delivery.ImagePath, replace: false);
             if (!delivery.Submitted && (await avatar is not null || await image is not null))
                 delivery.Submitted = Present(delivery, null, null, replace: false);
@@ -323,6 +345,18 @@ public sealed class NotificationService : IDisposable
 
     internal int NativeCount(object owner) => _deliveries.Sum(d => d.Native.Count(n => ReferenceEquals(n.Owner, owner)));
     private Delivery? Find(string token) => _deliveries.FirstOrDefault(d => d.Token == token);
+    // A Windows toast tag: the newest open delivery shown in it.
+    private Delivery? FindToast(string token) =>
+        _deliveries.Where(d => d.ToastToken == token).OrderBy(d => d.Closed).ThenByDescending(d => d.Created).FirstOrDefault();
+
+    // The open toast of the same conversation this message joins, if any.
+    private Delivery? GroupFor(Delivery delivery)
+    {
+        if (delivery.Value.ThreadUrl is not { } thread) return null;
+        var now = DateTimeOffset.UtcNow;
+        return _deliveries.LastOrDefault(d => d != delivery && d.Submitted && !d.Closed &&
+            d.Value.ThreadUrl == thread && now - d.Created <= GroupWindow);
+    }
     private static bool TryNative(Action action)
     {
         try { action(); return true; }
@@ -347,14 +381,14 @@ public sealed class NotificationService : IDisposable
             if (args.TryGetValue("action", out var action) && action == "mute")
             {
                 // The toast's Mute button: never opens the window.
-                var muted = Find(token);
+                var muted = FindToast(token);
                 thread = muted?.Value.ThreadUrl ?? thread;
                 if (muted is not null) Close(muted, remove: true);
                 if (thread is not null) MuteRequested?.Invoke(thread);
                 LoggingService.Write(LogEvent.NotificationMuted, code: thread is null ? 0 : 1);
                 return;
             }
-            if (Find(token) is { } d)
+            if (FindToast(token) is { } d)
             {
                 thread = d.Value.ThreadUrl ?? thread;
                 foreach (var native in d.Native.Where(n => n.Shown).ToArray()) TryNative(native.Notification.ReportClicked);
@@ -372,7 +406,8 @@ public sealed class NotificationService : IDisposable
     {
         if (d.Closed) return;
         d.Closed = true;
-        if (remove) _windows.Remove(d.Token);
+        // A grouped toast still showing a newer message belongs to that one.
+        if (remove && !_deliveries.Any(o => o != d && !o.Closed && o.ToastToken == d.ToastToken)) _windows.Remove(d.ToastToken);
         foreach (var native in d.Native)
         {
             TryNative(() => native.Notification.CloseRequested -= native.CloseHandler);

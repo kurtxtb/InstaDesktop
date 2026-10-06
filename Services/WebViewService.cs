@@ -157,7 +157,7 @@ public sealed class WebViewService : IDisposable
             if (_notifications.DirectInboxMonitoring) _directMonitorCheck.Start();
             await EnsureNotificationPermissionAsync(View.CoreWebView2);
             SetBackground(_background);
-            View.CoreWebView2.Navigate(_pendingNotificationThread ?? NavigationPolicy.Home);
+            View.CoreWebView2.Navigate(_pendingNotificationThread ?? StartPage);
             _pendingNotificationThread = null;
         }
         catch (Exception e)
@@ -220,6 +220,7 @@ public sealed class WebViewService : IDisposable
         catch (Exception error) { LoggingService.Write(LogEvent.NotificationInitializationFailed, error); }
         try { await EmojiFontService.ConfigureAsync(core); }
         catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
+        await ConfigureMediaDownloadsAsync(core);
         try { await core.AddScriptToExecuteOnDocumentCreatedAsync(ViewportStyleScript); }
         catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
         await ConfigureNotificationsAsync(core);
@@ -584,6 +585,25 @@ public sealed class WebViewService : IDisposable
 
     // Opens (or brings back) the floating inbox panel. Needs the main page's
     // environment, so it waits until Instagram has started once.
+    // A message notification opened in the panel needs the main page's environment.
+    public bool CanOpenMessagesWindow => !_disposed && Core is not null && !NeedsRecovery;
+    private string? _messagesStartUrl;
+    // Diagnostics: the conversation the panel was last sent to.
+    internal string? LastMessagesTarget { get; private set; }
+
+    // thread: a validated Direct conversation URL to show (null = the inbox).
+    public async Task<bool> OpenMessagesWindowAsync(string? thread)
+    {
+        string? safe = NotificationPolicy.DirectUrl(thread);
+        if (safe is not null)
+        {
+            LastMessagesTarget = safe;
+            if (_messagesWindow?.View.CoreWebView2 is { } ready) ready.Navigate(safe);
+            else _messagesStartUrl = safe;
+        }
+        return await OpenMessagesWindowAsync();
+    }
+
     public async Task<bool> OpenMessagesWindowAsync()
     {
         if (_disposed) return false;
@@ -639,7 +659,32 @@ public sealed class WebViewService : IDisposable
             try { await EmojiFontService.ConfigureAsync(core); }
             catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
             await core.AddScriptToExecuteOnDocumentCreatedAsync(ViewportStyleScript);
-            core.Navigate(DirectInboxMonitor.InboxUrl);
+            // Only the conversations: Instagram's global navigation is hidden,
+            // and anything outside Messages opens in the main window.
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(await ReadNotificationAssetAsync("messages-panel.js"));
+            await ConfigureMediaDownloadsAsync(core);
+            core.ContextMenuRequested += ContextMenuRequested;
+            core.NavigationStarting += (_, e) =>
+            {
+                if (!NavigationPolicy.IsTrusted(e.Uri) || IsPanelRoute(e.Uri)) return;
+                e.Cancel = true;
+                string target = e.Uri;
+                _owner.Dispatcher.BeginInvoke(new Action(() => OpenOutsideMessages(target)));
+            };
+            core.SourceChanged += (_, e) =>
+            {
+                // Same-document moves (Instagram is a single-page app) skip NavigationStarting.
+                if (e.IsNewDocument || IsPanelRoute(core.Source) || !NavigationPolicy.IsTrusted(core.Source)) return;
+                string target = core.Source;
+                _owner.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    OpenOutsideMessages(target);
+                    if (_messagesWindow?.View.CoreWebView2 is not { } panel) return;
+                    if (panel.CanGoBack) panel.GoBack(); else panel.Navigate(DirectInboxMonitor.InboxUrl);
+                }));
+            };
+            core.Navigate(_messagesStartUrl ?? DirectInboxMonitor.InboxUrl);
+            _messagesStartUrl = null;
             SetBackground(_background);
             LoggingService.Write(LogEvent.MessagesWindowOpened);
             return true;
@@ -665,6 +710,23 @@ public sealed class WebViewService : IDisposable
             });
         }
         catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
+    }
+
+    // What the messages panel may show itself: Messages, sign-in and calls.
+    internal static bool IsPanelRoute(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return true; // about:blank and the like
+        string path = uri.AbsolutePath;
+        return path.StartsWith("/direct/", StringComparison.Ordinal) || path.StartsWith("/accounts/", StringComparison.Ordinal) ||
+            path.StartsWith("/challenge", StringComparison.Ordinal) || path.Contains("call", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // A profile, post or reel opened from a conversation: show it in the main window.
+    private void OpenOutsideMessages(string url)
+    {
+        if (_disposed || !NavigationPolicy.IsTrusted(url)) return;
+        ShowRequested?.Invoke();
+        if (Core is { } core && !NeedsRecovery) core.Navigate(url);
     }
 
     // The panel's "open in main window": the same conversation, full size.
@@ -939,6 +1001,110 @@ public sealed class WebViewService : IDisposable
             if (HiddenMenuItems.Contains(name) || (!_settings.Current.DeveloperTools && name == "inspectElement"))
                 e.MenuItems.RemoveAt(i);
         }
+        if (sender is CoreWebView2 core) AddMediaMenuItem(core, e);
+    }
+
+    // ---- Download photo / video -------------------------------------------
+
+    private readonly MediaDownloads _media = new();
+    internal MediaDownloads Media => _media;
+    // Raised when a download from the context menu ends (saved, or why not).
+    internal event Action<MediaDownloadResult, bool>? MediaDownloadFinished;
+
+    private async Task ConfigureMediaDownloadsAsync(CoreWebView2 core)
+    {
+        try { await core.AddScriptToExecuteOnDocumentCreatedAsync(await ReadNotificationAssetAsync("media-download.js")); }
+        catch (Exception error) { LoggingService.Write(LogEvent.InjectionError, error); }
+        core.WebResourceResponseReceived += MediaResponseReceived;
+    }
+
+    // Posts loaded while scrolling arrive in API responses, not in the page.
+    private async void MediaResponseReceived(object? sender, CoreWebView2WebResourceResponseReceivedEventArgs e)
+    {
+        try
+        {
+            if (!Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri) || uri.Host != "www.instagram.com" ||
+                !(uri.AbsolutePath.StartsWith("/graphql", StringComparison.Ordinal) || uri.AbsolutePath.StartsWith("/api/", StringComparison.Ordinal)) ||
+                e.Response.StatusCode != 200) return;
+            using var stream = await e.Response.GetContentAsync();
+            if (stream is null || _disposed) return;
+            using var reader = new StreamReader(stream);
+            _media.AddResponse(await reader.ReadToEndAsync());
+        }
+        catch (Exception error) when (error is COMException or IOException or InvalidOperationException or ObjectDisposedException) { }
+    }
+
+    private async void AddMediaMenuItem(CoreWebView2 core, CoreWebView2ContextMenuRequestedEventArgs e)
+    {
+        CoreWebView2Deferral deferral;
+        try { deferral = e.GetDeferral(); }
+        catch (Exception error) when (error is COMException or InvalidOperationException) { return; }
+        try
+        {
+            var target = await TakeMediaTargetAsync(core);
+            if (target is null) return;
+            bool video = target.Kind == "video";
+            var item = core.Environment.CreateContextMenuItem(Loc.T(video ? "Media.DownloadVideo" : "Media.DownloadPhoto"), null,
+                CoreWebView2ContextMenuItemKind.Command);
+            item.CustomItemSelected += async (_, _) =>
+                MediaDownloadFinished?.Invoke(await DownloadMediaAsync(core, target), video);
+            e.MenuItems.Insert(0, item);
+            if (e.MenuItems.Count > 1)
+                e.MenuItems.Insert(1, core.Environment.CreateContextMenuItem("", null, CoreWebView2ContextMenuItemKind.Separator));
+        }
+        catch (Exception error) { LoggingService.Write(LogEvent.MediaDownloadFailed, error); }
+        finally { deferral.Complete(); }
+    }
+
+    // What the last right-click in that page was on (null: not a photo or video).
+    internal static async Task<MediaTarget?> TakeMediaTargetAsync(CoreWebView2 core)
+    {
+        string json = await core.ExecuteScriptAsync("JSON.stringify(window.__InstaDesktopMedia ? window.__InstaDesktopMedia.take() : null)");
+        if (JsonSerializer.Deserialize<string>(json) is not { } text || text == "null") return null;
+        MediaDownloads.FromPage(text, out var target);
+        return target;
+    }
+
+    internal async Task<MediaDownloadResult> DownloadMediaAsync(CoreWebView2 core, MediaTarget target)
+    {
+        try
+        {
+            string? key = target.Code ?? target.Story;
+            var info = _media.Find(key);
+            if (info is null && key is not null)
+            {
+                string json = await core.ExecuteScriptAsync("JSON.stringify(window.__InstaDesktopMedia ? window.__InstaDesktopMedia.lookup(" +
+                    JsonSerializer.Serialize(key) + ") : null)");
+                if (JsonSerializer.Deserialize<string>(json) is { } text && text != "null" && MediaDownloads.FromPage(text) is { } found)
+                {
+                    _media.Add(found);
+                    info = found;
+                }
+            }
+            if (MediaDownloads.Choose(target, info) is not { } url)
+                return new(target.Kind == "video" ? MediaDownloadOutcome.VideoUnavailable : MediaDownloadOutcome.NothingHere);
+            string name = MediaDownloads.BaseName(target, info);
+            string? file = null;
+            if (_settings.Current.AskDownloadLocation)
+            {
+                var dialog = new SaveFileDialog
+                {
+                    Title = Loc.T("Web.SaveDownload"), InitialDirectory = DownloadFolder,
+                    FileName = name + (target.Kind == "video" ? ".mp4" : ".jpg"), Filter = Loc.T("Web.AllFiles"), OverwritePrompt = true
+                };
+                if (dialog.ShowDialog(_owner) != true) return new(MediaDownloadOutcome.NothingHere);
+                file = dialog.FileName;
+            }
+            string path = await MediaDownloads.SaveAsync(url, DownloadFolder, name, file);
+            LoggingService.Write(LogEvent.MediaDownloaded, code: target.Kind == "video" ? 2 : 1);
+            return new(MediaDownloadOutcome.Saved, path);
+        }
+        catch (Exception error) when (error is System.Net.Http.HttpRequestException or IOException or UnauthorizedAccessException or
+            TaskCanceledException or InvalidOperationException or COMException)
+        {
+            LoggingService.Write(LogEvent.MediaDownloadFailed, error);
+            return new(MediaDownloadOutcome.Failed);
+        }
     }
 
     private void ProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e)
@@ -1036,9 +1202,44 @@ public sealed class WebViewService : IDisposable
         catch (Exception error) when (error is ArgumentException or JsonException or InvalidOperationException) { }
     }
 
+    // ---- Remember the last page --------------------------------------------
+
+    // The page to reopen: scheme, host and path only (no query, no fragment),
+    // never sign-in, checkpoint or call pages. null = not worth remembering.
+    internal static string? LastPageOf(string? url)
+    {
+        if (string.IsNullOrEmpty(url) || url.Length > 512 || !NavigationPolicy.IsTrusted(url) ||
+            !Uri.TryCreate(url, UriKind.Absolute, out var uri) || IsSessionRoute(url) || PathCategory(url) == 2) return null;
+        return "https://www.instagram.com" + uri.AbsolutePath;
+    }
+
+    internal string StartPageForDiagnostics => StartPage;
+
+    private string StartPage =>
+        _settings.Current.RememberLastPage && LastPageOf(_settings.Current.LastPage) is { } page ? page : NavigationPolicy.Home;
+
+    private DispatcherTimer? _lastPageSave;
+
+    // Saved a moment after the page settles, not on every step of a redirect.
+    private void ScheduleLastPageSave()
+    {
+        if (!_settings.Current.RememberLastPage || _disposed) return;
+        _lastPageSave ??= new DispatcherTimer(TimeSpan.FromSeconds(2), DispatcherPriority.Background, async (_, _) =>
+        {
+            _lastPageSave!.Stop();
+            if (_disposed || NeedsRecovery || Core is not { } core || !_settings.Current.RememberLastPage ||
+                LastPageOf(core.Source) is not { } page || page == _settings.Current.LastPage) return;
+            try { await _settings.UpdateAsync(s => s.LastPage = page); }
+            catch (Exception error) { LoggingService.Write(LogEvent.UnexpectedException, error); }
+        }, _owner.Dispatcher);
+        _lastPageSave.Stop();
+        _lastPageSave.Start();
+    }
+
     private async void SourceChanged(object? sender, CoreWebView2SourceChangedEventArgs e)
     {
         PublishNavigationState();
+        ScheduleLastPageSave();
         if (Core is { } sourceCore && IsSessionRoute(sourceCore.Source)) StopDirectMonitor();
         else _ = RefreshDirectMonitorAsync();
         if (e.IsNewDocument || Core is not { } core ||
@@ -1413,6 +1614,7 @@ public sealed class WebViewService : IDisposable
         _recoveryTimer.Stop();
         foreach (var window in _callWindows.ToArray()) window.Close();
         _messagesIdle?.Stop();
+        _lastPageSave?.Stop();
         _messagesWindow?.CloseForGood();
         ThemeService.Changed -= ApplyTheme;
         DisposeView();

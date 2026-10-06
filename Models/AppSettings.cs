@@ -8,6 +8,7 @@ using InstaDesktop.Services;
 namespace InstaDesktop.Models;
 
 public enum CloseButtonBehavior { MinimizeToTray, ExitApplication }
+public enum NotificationOpenTarget { MainWindow, MessagesPanel }
 
 public sealed class AppSettings
 {
@@ -27,6 +28,14 @@ public sealed class AppSettings
     // Direct thread URL -> muted until. Replace the dictionary to change it:
     // Copy() is shallow and Current must never change underneath a reader.
     public Dictionary<string, DateTimeOffset> MutedConversations { get; set; } = new();
+    // Where clicking a message notification opens the conversation.
+    public NotificationOpenTarget OpenNotificationsIn { get; set; } = NotificationOpenTarget.MainWindow;
+    // System-wide shortcuts ("Ctrl+Alt+I"); empty turns one off.
+    public string HotkeyShowWindow { get; set; } = "Ctrl+Alt+I";
+    public string HotkeyMessages { get; set; } = "Ctrl+Alt+M";
+    // Reopen on the page used last (path only, never sign-in or call pages).
+    public bool RememberLastPage { get; set; } = true;
+    public string? LastPage { get; set; }
     public AppTheme Theme { get; set; } = AppTheme.System;
     public UiLanguage Language { get; set; } = UiLanguage.System;
     public bool AllowMicrophone { get; set; }
@@ -72,8 +81,13 @@ public sealed class AppSettings
         else DownloadFolder = DownloadFolder.Trim();
         if (LastRunVersion is { Length: > 32 }) LastRunVersion = null;
         if (!Enum.IsDefined(Theme)) Theme = AppTheme.System;
+        if (!Enum.IsDefined(OpenNotificationsIn)) OpenNotificationsIn = NotificationOpenTarget.MainWindow;
+        HotkeyShowWindow = Hotkey.Parse(HotkeyShowWindow)?.ToString() ?? "";
+        HotkeyMessages = Hotkey.Parse(HotkeyMessages)?.ToString() ?? "";
+        if (!RememberLastPage || WebViewService.LastPageOf(LastPage) is not { } page) LastPage = null;
+        else LastPage = page;
         if (!Enum.IsDefined(Language)) Language = UiLanguage.System;
-        MessagesWidth = double.IsFinite(MessagesWidth) ? Math.Clamp(MessagesWidth, 360, 4000) : 440;
+        MessagesWidth = double.IsFinite(MessagesWidth) ? Math.Clamp(MessagesWidth, 340, 720) : 440;
         MessagesHeight = double.IsFinite(MessagesHeight) ? Math.Clamp(MessagesHeight, 480, 4000) : 720;
         if (MessagesLeft is double ml && !double.IsFinite(ml)) MessagesLeft = null;
         if (MessagesTop is double mt && !double.IsFinite(mt)) MessagesTop = null;

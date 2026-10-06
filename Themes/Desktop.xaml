@@ -101,6 +101,27 @@
             </ControlTemplate>
         </Setter.Value></Setter>
     </Style>
+    <Style TargetType="TextBox">
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryText}" />
+        <Setter Property="Background" Value="{DynamicResource Surface}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Outline}" />
+        <Setter Property="CaretBrush" Value="{DynamicResource PrimaryText}" />
+        <Setter Property="MinHeight" Value="36" />
+        <Setter Property="Padding" Value="10,0" />
+        <Setter Property="VerticalContentAlignment" Value="Center" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template"><Setter.Value>
+            <ControlTemplate TargetType="TextBox">
+                <Border x:Name="Box" CornerRadius="6" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1">
+                    <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center" Focusable="False" />
+                </Border>
+                <ControlTemplate.Triggers>
+                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Box" Property="Background" Value="{DynamicResource HoverSurface}" /></Trigger>
+                    <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Box" Property="BorderBrush" Value="{DynamicResource Accent}" /></Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter.Value></Setter>
+    </Style>
     <Style TargetType="ComboBoxItem">
         <Setter Property="Foreground" Value="{DynamicResource PrimaryText}" /><Setter Property="Padding" Value="12,8" />
         <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBoxItem">
